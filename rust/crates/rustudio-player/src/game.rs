@@ -134,6 +134,9 @@ pub struct Game {
     pub extra_adorn: Vec<rustudio_render::adorn::AdornDraw>,
     /// Extra Highlight draws for this frame (Team Create collaborator selections).
     pub extra_highlights: Vec<rustudio_render::highlight::HighlightDraw>,
+    /// Whether Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
+    /// is shown (View > Show Core UI; off by default in `--headless` runs).
+    pub show_core_gui: bool,
 }
 
 impl Game {
@@ -226,6 +229,7 @@ impl Game {
             view_render_size: None,
             extra_adorn: Vec::new(),
             extra_highlights: Vec::new(),
+            show_core_gui: true,
         }
     }
 }
@@ -299,14 +303,16 @@ impl Game {
             // When a TextBox is focused, Escape blurs the TextBox instead of
             // toggling the Roblox in-game menu.
             let textbox_focused = self.gui.focus.is_some();
-            if esc && !core_scripts && !textbox_focused {
+            if esc && !core_scripts && !textbox_focused && self.show_core_gui {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
             // never shows in keys_down, yet scripts must see it. The key
             // positions are physical, like Roblox's KeyCodes (src/keys.rs).
             // (When CoreScripts run and no TextBox is focused, Escape goes to
-            // the client runtime so SettingsHub's ContextActionService handles it.)
+            // the client runtime so SettingsHub's ContextActionService handles it.
+            // Not while Core UI is hidden: SettingsHub would open unseen and its
+            // RbxSettingsHubStopCharacter binding would hold the character.)
             let taps: Vec<Key> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -317,7 +323,7 @@ impl Game {
                             pressed: true,
                             repeat: false,
                             ..
-                        } if (core_scripts && !textbox_focused) || physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if (core_scripts && !textbox_focused && self.show_core_gui) || physical_key.unwrap_or(*key) != Key::Escape => {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,

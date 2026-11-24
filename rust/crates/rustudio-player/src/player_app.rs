@@ -90,6 +90,7 @@ impl PlayerApp {
         game.keep_game_settings = run.bench.is_none() && run.screenshot.is_none()
             && run.input.actions.is_empty() && run.shots.is_empty()
             && std::env::var_os("RUSTUDIO_NO_LAYOUT").is_none();
+        game.show_core_gui = run.show_core_gui;
         Self { game, host: PlayerHost::default(), run, last_frame: Instant::now(), last_work_ms: 0.0, profiler: None }
     }
 
@@ -238,6 +239,7 @@ pub fn run() -> eframe::Result<()> {
     let mut result = None;
     let mut headless = false;
     let mut no_render = false;
+    let mut show_core_ui: Option<bool> = None;
     let mut args = argv.iter().skip(1).cloned();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -392,6 +394,8 @@ pub fn run() -> eframe::Result<()> {
                 headless = true;
                 no_render = true;
             }
+            "--show-core-ui" => show_core_ui = Some(true),
+            "--hide-core-ui" | "--no-core-ui" => show_core_ui = Some(false),
             // (read at the start of main)
             "--audio" | "--play" | "--play-only" | "--no-ui" => {}
             "-h" | "--help" => {
@@ -433,6 +437,11 @@ pub fn run() -> eframe::Result<()> {
         rustudio_core::sim_clock::enable(dt);
     }
     demo |= screenshot.is_some() && open.is_none();
+    let (show_core_gui, show_core_gui_explicit) = crate::run_harness::resolve_show_core_gui(
+        show_core_ui,
+        std::env::var("RUSTUDIO_SHOW_CORE_UI").ok().as_deref(),
+        headless,
+    );
     let run = RunHarness {
             shot_after,
             log_out,
@@ -453,6 +462,8 @@ pub fn run() -> eframe::Result<()> {
             last_frame: None,
             no_ui: true,
             no_render,
+            show_core_gui,
+            show_core_gui_explicit,
             end_after: (seconds_given && bench.is_none() && profile_capture.is_none()).then_some(seconds),
             fail_on_error,
             result,

@@ -369,6 +369,9 @@ pub struct Gui {
     pub topbar_inset: Option<crate::ltypes::LRect>,
     /// The mobile editor supplies the Play top bar and its touch targets.
     pub mobile_play_controls: bool,
+    /// Hide Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
+    /// while keeping game UI (`PlayerGui` and world GUIs) visible.
+    pub hide_core_gui: bool,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,

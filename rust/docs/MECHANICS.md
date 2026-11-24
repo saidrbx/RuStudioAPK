@@ -3080,3 +3080,6 @@ diagnostic wrapper. Runtime confirmation of this fix on the Redmi is pending.
 ## Android editor workspace
 
 The Android script sheet takes 75% of the workspace as selected in the mobile mockup. While typing, it takes all available workspace height. The minimum script font size of 14 logical points is a mobile readability default.
+
+The right dock targets 27% of the available width on mobile, a small increase
+from 24% to give Explorer instance names more room.

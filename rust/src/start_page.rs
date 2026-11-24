@@ -746,6 +746,9 @@ impl Editor {
                 {
                     todo.push(Do::Account);
                 }
+                if crate::mobile::enabled() {
+                    self.mcp_top_button(ui);
+                }
                 ui.add_space(8.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.start.search)

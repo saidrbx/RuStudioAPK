@@ -285,9 +285,13 @@ impl Editor {
         // spacing so row i sits exactly at i * ROW_H.
         ui.spacing_mut().item_spacing.y = 0.0;
         let dragging = egui::DragAndDrop::has_payload_of_type::<DragRefs>(ui.ctx());
+        let touch_workspace = crate::mobile::enabled();
         let mut scroll = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt("explorer_scroll");
+        if touch_workspace {
+            scroll = scroll.scroll_source(egui::scroll_area::ScrollSource::ALL);
+        }
         if let Some(target) = self.explorer.scroll_to.take() {
             if let Some(idx) = rows.iter().position(|(r, _)| *r == target) {
                 let view_h = if self.explorer.view_h > 0.0 { self.explorer.view_h } else { ui.available_height() };
@@ -318,7 +322,7 @@ impl Editor {
             for i in range {
                 let (r, depth) = rows[i];
                 let top = ui.cursor().min.y;
-                self.explorer_row(ui, r, depth, &mut actions);
+                self.explorer_row(ui, r, depth, touch_workspace, &mut actions);
                 drawn.push((r, Rect::from_min_max(egui::pos2(ui.min_rect().min.x, top), egui::pos2(ui.max_rect().max.x, top + ROW_H))));
                 self.hud.explorer_rows += 1;
             }
@@ -422,7 +426,7 @@ impl Editor {
         }
     }
 
-    fn explorer_row(&mut self, ui: &mut egui::Ui, r: Ref, depth: usize, actions: &mut Vec<RowAction>) {
+    fn explorer_row(&mut self, ui: &mut egui::Ui, r: Ref, depth: usize, touch_workspace: bool, actions: &mut Vec<RowAction>) {
         let Some(inst) = self.game.doc.dom.get_by_ref(r) else {
             return;
         };
@@ -438,7 +442,9 @@ impl Editor {
         let selected = self.game.doc.selection.contains(&r);
         let expanded = self.explorer.expanded.contains(&r) || self.explorer.forced_open.contains(&r);
 
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click_and_drag());
+        // A click-only row lets the scroll area's background own touch drags.
+        let sense = if touch_workspace { Sense::click() } else { Sense::click_and_drag() };
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), sense);
         let painter = ui.painter_at(rect);
         // Drag over this row: above / into / below by the pointer's height.
         let drop = resp.dnd_hover_payload::<DragRefs>().and_then(|_| {
@@ -486,15 +492,43 @@ impl Editor {
             let glyph = if expanded { "caret-down-filled" } else { "caret-right-filled" };
             rustudio_engine::ti::paint(&painter, tri_rect, glyph, theme::TEXT_DIM);
         }
+        let is_starter_gui = class == "StarterGui";
+        let sg_ref = self.game.doc.find_child(self.game.doc.dom.root_ref(), "StarterGui");
+        let gui_hidden = !self.starter_gui_shown()
+            && sg_ref.is_some_and(|sg| r == sg || self.game.doc.is_ancestor(sg, r));
         let icon_rect = Rect::from_center_size(Pos2::new(x0 + 22.0, rect.center().y), Vec2::splat(16.0));
         if !icons::paint_part_icon(&painter, icon_rect, &class, shape) {
             icons::paint_class_icon(&painter, icon_rect, &class);
         }
         let text_pos = Pos2::new(x0 + 34.0, rect.center().y);
+        // StarterGui eye toggle (ShowDevelopmentGui): toggles edit-mode UI
+        // visibility on StarterGui (Studio's UI visibility toggle and the
+        // Explorer's dimmed StarterGui rows).
+        let eye_rect = is_starter_gui.then(|| {
+            Rect::from_center_size(Pos2::new(rect.max.x - 10.0, rect.center().y), Vec2::splat(16.0))
+        });
+        let eye = eye_rect.map(|er| {
+            let e = ui.interact(er, egui::Id::new(("explorer_gui_eye", r)), Sense::click());
+            let shown = self.starter_gui_shown();
+            if e.hovered() {
+                painter.rect_filled(er.expand(1.0), 3.0, theme::ACTIVE_TAB);
+            }
+            let glyph = if shown { "eye" } else { "eye-off" };
+            let col = if e.hovered() {
+                Color32::WHITE
+            } else if shown {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            };
+            rustudio_engine::ti::paint(&painter, er, glyph, col);
+            e.on_hover_text("Toggle UI Visibility (ShowDevelopmentGui)")
+        });
         // The "+" just right of the name while the row is hovered (Studio's quick insert).
         let label = if name.is_empty() { format!("({class})") } else { name.clone() };
         let name_w = ui.fonts_mut(|f| f.layout_no_wrap(label, egui::FontId::proportional(13.0), theme::TEXT).size().x);
-        let plus_x = (text_pos.x + name_w + 6.0 + 8.0).min(rect.max.x - 10.0);
+        let right_pad = if is_starter_gui { 28.0 } else { 10.0 };
+        let plus_x = (text_pos.x + name_w + 6.0 + 8.0).min(rect.max.x - right_pad);
         let plus_rect = Rect::from_center_size(Pos2::new(plus_x, rect.center().y), Vec2::splat(16.0));
         let row_hot = ui.rect_contains_pointer(rect) && !egui::DragAndDrop::has_any_payload(ui.ctx());
         let plus = row_hot.then(|| ui.interact(plus_rect, egui::Id::new(("explorer_plus", r)), Sense::click()));
@@ -528,12 +562,25 @@ impl Editor {
                 self.explorer.renaming = Some((r, text));
             }
         } else {
-            let color = if selected { Color32::WHITE } else { theme::TEXT };
+            // Studio ExplorerPlugin (IsGuiShown + getIsIconEnabled): dim StarterGui
+            // and its descendants when ShowDevelopmentGui is false.
+            let color = if selected {
+                Color32::WHITE
+            } else if gui_hidden {
+                theme::TEXT_DIM
+            } else {
+                theme::TEXT
+            };
             let (label, col) = if name.is_empty() { (format!("({class})"), theme::TEXT_DIM) } else { (name.clone(), color) };
             painter.text(text_pos, egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), col);
         }
 
         // Interaction.
+        if let Some(e) = eye.filter(|e| e.clicked()) {
+            let _ = e;
+            actions.push(RowAction::ToggleShowDevelopmentGui);
+            return;
+        }
         if let Some(p) = plus.filter(|p| p.clicked()) {
             actions.push(RowAction::InsertDialog(r, p.rect.right_bottom()));
             return;
@@ -622,7 +669,12 @@ impl Editor {
                 ui.close();
             }
             ui.separator();
-            if item(ui, "Group as Model", true) {
+            let group_label = if self.game.doc.should_group_as_frame(&self.game.doc.selection) {
+                "Group as Frame"
+            } else {
+                "Group as Model"
+            };
+            if item(ui, group_label, true) {
                 actions.push(RowAction::Action("group"));
                 ui.close();
             }
@@ -770,6 +822,10 @@ impl Editor {
             RowAction::OpenScript(r) => {
                 self.open_script.push(r);
             }
+            RowAction::ToggleShowDevelopmentGui => {
+                let next = !self.starter_gui_shown();
+                self.set_starter_gui_shown(next);
+            }
         }
     }
 }
@@ -789,6 +845,7 @@ enum RowAction {
     Action(&'static str),
     SelectChildren(Ref),
     OpenScript(Ref),
+    ToggleShowDevelopmentGui,
 }
 
 #[cfg(test)]

@@ -7,7 +7,12 @@ impl Editor {
         if self.game.is_playing() { return; }
         if response.clicked_by(PointerButton::Secondary) {
             if let Some(p) = response.interact_pointer_pos() {
-                let hit = self.pick(response.rect, p, ui.input(|i| i.modifiers.alt));
+                let hit = self
+                    .ui
+                    .show_gui
+                    .then(|| self.game.gui.object_at(p))
+                    .flatten()
+                    .or_else(|| self.pick(response.rect, p, ui.input(|i| i.modifiers.alt)));
                 match hit {
                     Some(r) if !self.game.doc.selection.contains(&r) => self.select(vec![r]),
                     None => self.select(Vec::new()),
@@ -43,7 +48,12 @@ impl Editor {
             item(ui,"Duplicate","Ctrl+D","duplicate");
             item(ui,"Delete","Del","delete");
             ui.separator();
-            item(ui,"Group as Model","Ctrl+G","group");
+            let group_label = if self.game.doc.should_group_as_frame(&self.game.doc.selection) {
+                "Group as Frame"
+            } else {
+                "Group as Model"
+            };
+            item(ui,group_label,"Ctrl+G","group");
             item(ui,"Group as Folder","Ctrl+Alt+G","group_folder");
             item(ui,"Ungroup","Ctrl+U","ungroup");
             item(ui,"Union","Ctrl+Shift+G","union");

@@ -423,6 +423,52 @@ fn new_document_reloads_plugins() {
 }
 
 #[test]
+fn opening_a_place_starts_eager_builtins_once() {
+    // Opening a place re-registers the built-ins (replace_builtins) and the
+    // new document reloads running plugins: each must start once, or its
+    // second start hits "Cannot create more than one button" (SimulationStep,
+    // UIEditor on every place open).
+    temp_data();
+    let dir = std::env::temp_dir().join(format!("rustudio-builtin-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    dom.insert(
+        root,
+        InstanceBuilder::new("Script").with_name("Loader").with_property(
+            "Source",
+            r#"print("started")
+            local ok, err = pcall(function() return plugin:CreateToolbar("OnceBar"):CreateButton("Go", "", "") end)
+            print("button", ok, err)"#
+                .to_string(),
+        ),
+    );
+    let tops = dom.root().children().to_vec();
+    let mut bin = Vec::new();
+    rbx_binary::to_writer(&mut bin, &dom, &tops).unwrap();
+    // Not in the deferred manifests: loads eagerly, like SimulationStep.
+    std::fs::write(dir.join("OnceTool.rbxm"), &bin).unwrap();
+
+    let mut doc = Document::new_place();
+    let mut h = PluginHost::default();
+    h.load_builtin_dir(&dir, None).into_iter().for_each(|r| { r.unwrap(); });
+    frames(&mut h, &mut doc, 2);
+    let out = lines(&mut h);
+    assert_eq!(out.iter().filter(|l| l.as_str() == "started").count(), 1, "{out:#?}");
+
+    // The place switch: the editor's on-place-opened swaps the built-ins.
+    let mut other = Document::new_place();
+    h.specs.retain(|s| !s.source.is_builtin());
+    h.load_builtin_dir(&dir, None).into_iter().for_each(|r| { r.unwrap(); });
+    frames(&mut h, &mut other, 2);
+    let out = lines(&mut h);
+    assert_eq!(out.iter().filter(|l| l.as_str() == "started").count(), 1, "{out:#?}");
+    assert!(out.iter().all(|l| !l.contains("Cannot create more than one button")), "{out:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn play_copies_run_with_play_values() {
     temp_data();
     let mut doc = Document::new_place();

@@ -417,6 +417,10 @@ pub struct PluginUi {
     xdrag_dead: bool,
     /// Buttons held over the viewport (the PluginMouse's Button1Up etc.).
     view_buttons: [bool; 2],
+    /// The left button went down over the viewport (UserInputService
+    /// InputBegan): its InputEnded comes even when it is let go outside
+    /// the view, or a UIEditor drag never finishes.
+    uis_left_held: bool,
     keys_down: HashSet<String>,
     keys_sent: HashSet<String>,
     layout_sent: HashMap<Ref, GuiBox>,
@@ -1063,6 +1067,8 @@ impl Editor {
     pub fn plugin_viewport(&mut self, ctx: &egui::Context, painter: &egui::Painter, rect: Rect, resp: &egui::Response) -> bool {
         if !self.plugins_on() || self.game.play.is_some() {
             self.plugin_ui.view = ViewIn::default();
+            // A press that was down when Play started ended in Play, not here.
+            self.plugin_ui.uis_left_held = false;
             return false;
         }
         reg().view = [rect.width(), rect.height()];
@@ -1074,7 +1080,8 @@ impl Editor {
             .hover_pos()
             .or_else(|| if self.toolbox_drag_in_live() { ctx.pointer_hover_pos() } else { None })
             .filter(|p| rect.contains(*p));
-        let was_over = self.plugin_ui.view.xy.is_some();
+        let prev_xy = self.plugin_ui.view.xy;
+        let was_over = prev_xy.is_some();
         let now_over = pointer.is_some();
         if was_over != now_over {
             self.plugin_ui.queue.push(In::ViewportHover(now_over));
@@ -1197,6 +1204,23 @@ impl Editor {
         // UserInputService after the PluginMouse (F57: Button1Down came
         // before UIS.InputBegan); gameProcessed over CoreGui GUI.
         if pointer.is_some() {
+            // Pointer motion over the view: UserInputService.InputBegan
+            // (MouseMovement) as it comes in (checks/plugins/ref/captures/
+            // ui.txt), then InputChanged (MouseMovement) at each move.
+            // Roblox's UIEditor moves and resizes GUIs only from these: its
+            // onInputChanged (UIEditor.rbxm main, line 279) runs Move /
+            // Resize :updateDrag(Vector2(io.Position.x, io.Position.y)) for
+            // MouseMovement, and nothing else feeds a drag.
+            if let Some(m) = mouse_motion(prev_xy, xy) {
+                self.plugin_ui.queue.push(In::Uis {
+                    state: m.0,
+                    uit: "MouseMovement",
+                    key: "Unknown".into(),
+                    pos: [xy[0], xy[1], 0.0],
+                    delta: m.1,
+                    gp: over_gui,
+                });
+            }
             // (a press on a handle: after the handle's MouseButton1Down)
             let q = if adorn_hot && !over_gui {
                 &mut self.plugin_ui.late
@@ -1204,6 +1228,24 @@ impl Editor {
                 &mut self.plugin_ui.queue
             };
             push_buttons(ctx, q, over_gui || adorn_handles, xy);
+            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                self.plugin_ui.uis_left_held = true;
+            }
+            if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                self.plugin_ui.uis_left_held = false;
+            }
+        } else if self.plugin_ui.uis_left_held && !ctx.input(|i| i.pointer.primary_down()) {
+            // (let go outside the view: where the pointer was last over it)
+            self.plugin_ui.uis_left_held = false;
+            let last = prev_xy.unwrap_or(xy);
+            self.plugin_ui.queue.push(In::Uis {
+                state: "End",
+                uit: "MouseButton1",
+                key: "Unknown".into(),
+                pos: [last[0], last[1], 0.0],
+                delta: [0.0; 2],
+                gp: false,
+            });
         }
         if !(active && pointer.is_some() && !over_gui) {
             // (a release outside still ends a press the mouse had)
@@ -1833,6 +1875,18 @@ fn explorer_drag_widget(
     XGui::Drop(p)
 }
 
+/// UserInputService's MouseMovement input for the pointer now at `now`
+/// over the view (`prev`: where it was last frame, None when it was not
+/// over the view): InputBegan as it comes in, InputChanged when it moved
+/// (state, delta); None when it stayed put.
+fn mouse_motion(prev: Option<[f32; 2]>, now: [f32; 2]) -> Option<(&'static str, [f32; 2])> {
+    match prev {
+        None => Some(("Begin", [0.0, 0.0])),
+        Some(p) if p != now => Some(("Change", [now[0] - p[0], now[1] - p[1]])),
+        Some(_) => None,
+    }
+}
+
 /// UserInputService's InputBegan / InputEnded for mouse buttons pressed
 /// this frame (gameProcessed: over GUI).
 fn push_buttons(ctx: &egui::Context, q: &mut Vec<In>, gp: bool, xy: [f32; 2]) {
@@ -2310,6 +2364,40 @@ mod tests {
         let mut new: HashMap<Ref, GuiBox> = HashMap::new();
         keep_play_layout(&old, &mut new);
         assert!(new.contains_key(&w) && !new.contains_key(&game));
+    }
+
+    /// Pointer motion over the edit view reaches the edit DataModel's
+    /// UserInputService: InputBegan (MouseMovement) as the pointer comes in,
+    /// then InputChanged (MouseMovement) at each move, positions in view
+    /// pixels. Roblox's UIEditor moves / resizes GUIs only from InputChanged
+    /// (UIEditor.rbxm main onInputChanged), so without it dragging a Frame
+    /// or its handles did nothing.
+    #[test]
+    fn view_pointer_motion_reaches_user_input_service() {
+        assert_eq!(mouse_motion(None, [5.0, 6.0]), Some(("Begin", [0.0, 0.0])));
+        assert_eq!(mouse_motion(Some([5.0, 6.0]), [5.0, 6.0]), None);
+        assert_eq!(mouse_motion(Some([5.0, 6.0]), [8.0, 2.0]), Some(("Change", [3.0, -4.0])));
+        let (mut h, mut doc) = host_with(
+            r#"
+            local UIS = game:GetService("UserInputService")
+            UIS.InputBegan:Connect(function(io, gp) print("[T] began", io.UserInputType.Name, io.Position.X, io.Position.Y, gp) end)
+            UIS.InputChanged:Connect(function(io, gp) print("[T] changed", io.UserInputType.Name, io.Position.x, io.Position.y, io.Delta.X, io.Delta.Y, gp) end)
+            "#,
+        );
+        run(&mut h, &mut doc, 2);
+        let mut q = Vec::new();
+        let mut prev = None;
+        for xy in [[350.0, 250.0], [360.0, 255.0], [360.0, 255.0]] {
+            if let Some((state, delta)) = mouse_motion(prev, xy) {
+                q.push(In::Uis { state, uit: "MouseMovement", key: "Unknown".into(), pos: [xy[0], xy[1], 0.0], delta, gp: false });
+            }
+            prev = Some(xy);
+        }
+        assert_eq!(q.len(), 2);
+        h.with_edit(&mut doc, |rt| fire_inputs(rt, q, None, None));
+        let out = run(&mut h, &mut doc, 2);
+        assert!(out.iter().any(|l| l == "[T] began MouseMovement 350 250 false"), "{out:#?}");
+        assert!(out.iter().any(|l| l.starts_with("[T] changed MouseMovement 360 255 ")), "{out:#?}");
     }
 
     #[test]

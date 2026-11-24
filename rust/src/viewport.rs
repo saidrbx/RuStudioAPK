@@ -128,6 +128,26 @@ struct HoverKey {
 }
 
 impl Editor {
+    /// The ScreenGui object drawn under `p` in the edit view, if the GUI is
+    /// shown. ScreenGuis draw over world GUIs, so the topmost hit is a
+    /// ScreenGui's whenever one is there.
+    fn screen_gui_at(&self, p: Pos2) -> Option<Ref> {
+        if !self.ui.show_gui {
+            return None;
+        }
+        let r = self.game.gui.object_at(p)?;
+        let doc = &self.game.doc;
+        let mut cur = doc.dom.get_by_ref(r).map(|i| i.parent());
+        while let Some(a) = cur.filter(|a| a.is_some()) {
+            let inst = doc.dom.get_by_ref(a)?;
+            if inst.class == "ScreenGui" {
+                return Some(r);
+            }
+            cur = Some(inst.parent());
+        }
+        None
+    }
+
     /// Fly speed multiplier over the base step, Studio's rule:
     /// the base step until 120 ticks held, then ticks / 240 studs, capped at 15
     /// (×30 base, reached after about 25 s).
@@ -519,7 +539,10 @@ impl Editor {
         // game: its camera scripts turn and zoom the view.
         let driving = self.game.play_game_input();
         let wheel = crate::game_view::wheel_notches(&ctx);
-        let notches = wheel + crate::mobile::pinch_notches(&ctx);
+        let edit_gesture = (!driving && !context_menu_open)
+            .then(|| crate::mobile::edit_camera_gesture(&ctx))
+            .flatten()
+            .filter(|gesture| rect.contains(gesture.center_pos));
         if !driving && (self.game.game_grab.is_some() || self.game.game_cursor_hidden) {
             self.game.release_game_mouse(&ctx);
         }
@@ -533,10 +556,12 @@ impl Editor {
                 }
             }
             if !touch || !cfg!(target_os = "android") && !ctx.input(|i| i.has_touch_screen()) {
-                self.game.update_game_mouse(&ctx, &resp, delta, if touch { 0.0 } else { notches });
+                self.game.update_game_mouse(&ctx, &resp, delta, if touch { 0.0 } else { wheel + crate::mobile::pinch_notches(&ctx) });
             }
-        } else if !context_menu_open && !over_selector && resp.hovered() && notches != 0.0 {
-            if let Some(p) = resp.hover_pos() {
+        } else if !context_menu_open && !over_selector {
+            let notches = if resp.hovered() { wheel } else { 0.0 }
+                + edit_gesture.map_or(0.0, |gesture| gesture.zoom_delta.ln() * 10.0);
+            if let Some(p) = edit_gesture.map(|gesture| gesture.center_pos).or(resp.hover_pos()).filter(|_| notches != 0.0) {
                 let ray = self.game.cam.ray(rect, p);
                 let hit = self.ray_distance(&ray);
                 self.game.cam.zoom_toward(ray.dir, notches, shift, &crate::studio_settings::camera_prefs());
@@ -555,7 +580,7 @@ impl Editor {
             if resp.dragged_by(PointerButton::Middle) {
                 self.game.cam.pan(delta.x, delta.y, &crate::studio_settings::camera_prefs());
             }
-            if let Some(d) = crate::mobile::two_finger_pan(&ctx) {
+            if let Some(d) = edit_gesture.map(|gesture| gesture.translation_delta).filter(|&d| d != egui::Vec2::ZERO) {
                 self.game.cam.pan(d.x, d.y, &crate::studio_settings::camera_prefs());
             }
             if alt && resp.dragged_by(PointerButton::Primary) && self.drag.is_none() {
@@ -665,7 +690,9 @@ impl Editor {
             && !self.clean_view
             && !roblox_dragger_idle
         {
-            pointer.and_then(|p| self.hover_pick(rect, p, alt))
+            pointer
+                .filter(|p| self.screen_gui_at(*p).is_none())
+                .and_then(|p| self.hover_pick(rect, p, alt))
         } else {
             None
         };
@@ -700,6 +727,7 @@ impl Editor {
 
         let playing = self.game.is_playing();
         let show_gui = self.ui.show_gui;
+        self.game.show_core_gui = self.ui.show_core_gui;
         let gui_took = self.game.draw_view_gui(&ctx, &painter, rect, &resp, show_gui);
         // What plugins put in CoreGui, over the edit view, and the edit-mode
         // input plugins hear (src/plugin_host/widgets_ui.rs); a press a
@@ -806,6 +834,11 @@ impl Editor {
                 if let Some(h) = self.handle_at(&handles, p) {
                     self.start_drag(rect, h, p);
                 } else if alt {
+                } else if self.screen_gui_at(p).is_some() {
+                    // A ScreenGui object under the pointer blocks 3D part drag /
+                    // 3D marquee (UIEditor handles GUI dragging when active).
+                    // SurfaceGuis / BillboardGuis on parts don't: the part under
+                    // them still drags and hovers.
                 } else if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate | Tool::Transform)
                     && self.start_part_drag(rect, p, ctrl || shift)
                 {
@@ -854,9 +887,11 @@ impl Editor {
         if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
-                let hit = self.game
-                    .gui
-                    .object_at(p)
+                let hit = self
+                    .ui
+                    .show_gui
+                    .then(|| self.game.gui.object_at(p))
+                    .flatten()
                     .or_else(|| self.pick(rect, p, ctx.input(|i| i.modifiers.alt)));
                 match (hit, ctrl || shift) {
                     (Some(r), true) => {

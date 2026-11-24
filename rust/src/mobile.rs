@@ -12,7 +12,7 @@
 //!   * Edit: the view's mode buttons choose what one finger does in the 3D
 //!     view (Select = left button, Orbit = Alt + left drag, Look = right
 //!     drag); two fingers pinch to zoom and drag to pan (see
-//!     [`pinch_notches`] / [`two_finger_pan`]); outside the 3D view a finger
+//!     [`edit_camera_gesture`]); outside the 3D view a finger
 //!     is the left button;
 //! - [`hud`] draws the stick, the jump button and the mode / menu buttons;
 //! - [`tune`] makes egui's widgets finger-sized;
@@ -168,9 +168,12 @@ pub fn play_pinch_notches(ctx: &egui::Context) -> f32 {
     pinch_notches(ctx)
 }
 
-/// Two-finger drag, in points (like a middle-button drag).
-pub fn two_finger_pan(ctx: &egui::Context) -> Option<Vec2> {
-    ctx.input(|i| i.multi_touch().map(|m| m.translation_delta)).filter(|d| *d != Vec2::ZERO)
+/// A camera gesture starts with both fingers in the viewport.
+pub fn edit_camera_gesture(ctx: &egui::Context) -> Option<egui::MultiTouchInfo> {
+    if enabled() && !st().edit_pinch() {
+        return None;
+    }
+    ctx.input(|i| i.multi_touch())
 }
 
 fn jump_center(view: Rect) -> Pos2 {
@@ -199,6 +202,12 @@ fn button_event(pos: Pos2, button: PointerButton, pressed: bool, alt: bool) -> E
 impl State {
     fn play_pinch(&self) -> bool {
         self.touches.len() == 2 && self.touches.iter().all(|t| t.role == Role::Look)
+    }
+
+    fn edit_pinch(&self) -> bool {
+        self.touches.len() == 2 && self.live_view().is_some_and(|view| {
+            self.touches.iter().all(|touch| view.contains(touch.start))
+        })
     }
 
     fn classify(&self, pos: Pos2, playing: bool) -> Role {
@@ -389,7 +398,7 @@ impl State {
                     role == Role::Look && self.touches.iter().filter(|t| t.role == Role::Look).count() >= 2
                         && matches!(self.ptr, Some((_, Ptr::PlayPending | Ptr::PlayResume | Ptr::PlayLook)))
                 } else {
-                    self.touches.iter().filter(|t| matches!(t.role, Role::Pointer | Role::Extra)).count() >= 2
+                    self.edit_pinch()
                 };
                 if second_finger {
                     let last = self.ptr.and_then(|(id, _)| self.touches.iter().find(|t| t.id == id).map(|t| t.pos)).unwrap_or(pos);
@@ -550,13 +559,11 @@ pub fn take_play_look() -> Vec<TouchLookEvent> {
     std::mem::take(&mut st().look)
 }
 
-/// Per-frame touch UI plus (Android) the soft keyboard. Call once per frame.
+/// Polls Android file dialogs. egui-winit handles soft keyboard visibility
+/// from the focused text edit's IME output.
 pub fn frame(_ctx: &egui::Context) {
     #[cfg(target_os = "android")]
-    {
-        crate::android::sync_soft_keyboard(_ctx);
-        crate::android_dialog::poll_async(_ctx);
-    }
+    crate::android_dialog::poll_async(_ctx);
 }
 
 pub(crate) fn select_edit_mode() {
@@ -565,14 +572,19 @@ pub(crate) fn select_edit_mode() {
 
 pub(crate) fn edit_camera_controls(ui: &mut egui::Ui) {
     let mode = st().mode;
-    for (candidate, label) in [
-        (ViewMode::Select, "Select"), (ViewMode::Orbit, "Orbit"), (ViewMode::Look, "Look"),
+    for (candidate, label, hint) in [
+        (ViewMode::Select, "Select objects", "Tap to select. Drag to use the active tool."),
+        (ViewMode::Orbit, "Orbit camera", "Drag around the camera's focus point."),
+        (ViewMode::Look, "Look around", "Drag to turn the camera in place."),
     ] {
-        if ui.selectable_label(mode == candidate, label).clicked() {
+        let text = format!("{label}\n{hint}");
+        if ui.selectable_label(mode == candidate, text).clicked() {
             st().mode = candidate;
             ui.close();
         }
     }
+    ui.separator();
+    ui.label("Drag with two fingers to pan. Pinch to zoom.");
 }
 
 pub(crate) fn hud(ctx: &egui::Context, game: &mut crate::game::Game) {
@@ -729,6 +741,19 @@ mod tests {
         let mut state = State::new();
         state.view = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)));
         state
+    }
+
+    #[test]
+    fn editor_pinch_requires_both_fingers_to_start_in_the_viewport() {
+        let mut state = state_with_view();
+        let mut events = Vec::new();
+        state.on_touch(1, TouchPhase::Start, egui::pos2(700.0, 100.0), false, false, &mut events);
+        state.on_touch(2, TouchPhase::Start, egui::pos2(900.0, 100.0), false, false, &mut events);
+        state.on_touch(2, TouchPhase::Move, egui::pos2(750.0, 100.0), false, false, &mut events);
+        assert!(!state.edit_pinch());
+        state.on_touch(2, TouchPhase::End, egui::pos2(750.0, 100.0), false, false, &mut events);
+        state.on_touch(3, TouchPhase::Start, egui::pos2(750.0, 100.0), false, false, &mut events);
+        assert!(state.edit_pinch());
     }
 
     #[test]

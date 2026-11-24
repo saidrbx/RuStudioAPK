@@ -51,6 +51,7 @@ enum State {
         lines: usize,
         generation: u64,
         row_height: f32,
+        wrap_text: bool,
     },
 }
 
@@ -210,6 +211,13 @@ impl Editor {
                 {
                     return false;
                 }
+                // A GUI object shows values the GUI layout computes
+                // (AbsolutePosition, AbsoluteSize, TextBounds…) from its
+                // ancestors and the view, which no journal mark on the
+                // selection covers: draw it fresh.
+                if doc.class_of(first).is_some_and(|class| rustudio_core::doc::is_a(&class, "GuiBase2d")) {
+                    return false;
+                }
                 let now = doc.journal_end();
                 if *journal == now {
                     return true;
@@ -234,10 +242,12 @@ impl Editor {
                 lines,
                 generation,
                 row_height,
+                wrap_text,
             } => {
                 *lines == self.game.log.len()
                     && *generation == self.output_view.log_generation
                     && *row_height == crate::output_panel::line_h()
+                    && *wrap_text == self.output_view.wrap_text
             }
         }
     }
@@ -266,6 +276,7 @@ impl Editor {
                 lines: self.game.log.len(),
                 generation: self.output_view.log_generation,
                 row_height: crate::output_panel::line_h(),
+                wrap_text: self.output_view.wrap_text,
             },
             _ => unreachable!("only Explorer, Properties and Output are retained"),
         }

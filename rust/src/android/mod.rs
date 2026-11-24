@@ -1,6 +1,7 @@
 //! NativeActivity entry point and Android input integration.
 
 mod environment;
+pub(crate) mod keyboard;
 mod logcat;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,7 @@ fn android_main(app: AndroidApp) {
     if let Err(e) = crate::run() {
         eprintln!("rustudio: stopped with an error: {e}");
     }
+    keyboard::reset();
     // Leaving android_main ends the native thread; the activity finishes.
     *APP.write().expect("Android activity state") = None;
     STARTED.store(false, Ordering::SeqCst);
@@ -43,35 +45,27 @@ fn android_main(app: AndroidApp) {
 
 /// Opens the Android share sheet for saved diagnostic logs.
 pub(crate) fn share_logs() -> Result<(), String> {
-    let app = app().ok_or("Android activity unavailable")?;
-    // The app owns both JNI references throughout this call.
-    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
-    let activity = app.activity_as_ptr().cast();
-    vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-        let activity = unsafe { env.as_cast_raw::<jni::objects::JObject>(&activity)? };
+    with_activity(|env, activity| {
         env.call_method(
-            activity.as_ref(),
+            activity,
             jni::jni_str!("shareDiagnosticLogs"),
             jni::jni_sig!(() -> void),
             &[],
         )?;
         Ok(())
     })
-    .map_err(|error| error.to_string())
 }
 
-/// Shows or hides the soft keyboard when an egui text field gains or loses
-/// focus (called once per frame from mobile::frame).
-pub fn sync_soft_keyboard(ctx: &egui::Context) {
-    static SHOWN: AtomicBool = AtomicBool::new(false);
-    let want = ctx.egui_wants_keyboard_input();
-    if SHOWN.swap(want, Ordering::Relaxed) != want {
-        if let Some(a) = app() {
-            if want {
-                a.show_soft_input(true);
-            } else {
-                a.hide_soft_input(true);
-            }
-        }
-    }
+fn with_activity(
+    call: impl FnOnce(&mut jni::Env<'_>, &jni::objects::JObject<'_>) -> jni::errors::Result<()>,
+) -> Result<(), String> {
+    let app = app().ok_or("Android activity unavailable")?;
+    // The app owns both JNI references throughout this call.
+    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity = app.activity_as_ptr().cast();
+    vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let activity = unsafe { env.as_cast_raw::<jni::objects::JObject>(&activity)? };
+        call(env, activity.as_ref())
+    })
+    .map_err(|error| error.to_string())
 }

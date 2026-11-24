@@ -837,7 +837,20 @@ impl PluginHost {
             for s in &mut self.specs {
                 s.running = false;
             }
-            let ids: Vec<PluginId> = self.specs.iter().filter(|s| s.deferred.is_none()).map(|s| s.id).collect();
+            // A plugin already queued (a place open re-registers the
+            // built-ins with their own Load) starts once, not twice: a second
+            // start under the same id finds its toolbar and fails with
+            // "Cannot create more than one button".
+            let queued: std::collections::HashSet<PluginId> = self
+                .cmds
+                .iter()
+                .filter_map(|c| match c {
+                    Cmd::Load(id) | Cmd::Wake(id) | Cmd::Reload(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            let ids: Vec<PluginId> =
+                self.specs.iter().filter(|s| s.deferred.is_none() && !queued.contains(&s.id)).map(|s| s.id).collect();
             let mut cmds: Vec<Cmd> = ids.into_iter().map(Cmd::Load).collect();
             cmds.append(&mut self.cmds);
             self.cmds = cmds;

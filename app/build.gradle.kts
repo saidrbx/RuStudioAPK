@@ -19,8 +19,8 @@ android {
         applicationId = "com.rustudio.app"
         minSdk = 26
         targetSdk = 34 // 35 would force edge-to-edge insets on the native window
-        versionCode = 27
-        versionName = "0.5.1-android.3"
+        versionCode = 28
+        versionName = "0.5.2-android.1"
         ndk { abiFilters += rustAbis }
     }
 

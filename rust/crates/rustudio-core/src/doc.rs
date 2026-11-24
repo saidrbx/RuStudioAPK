@@ -1898,23 +1898,82 @@ impl Document {
         out
     }
 
-    /// Wraps the instances in a new Model under their first common parent.
-    pub fn group(&mut self, refs: &[Ref]) -> Option<Ref> {
-        self.group_as(refs, "Model")
+    /// Studio `GroupSelectionAction` (`Studio.SystemMenu.Title.GroupAsFrame`):
+    /// groups into a `Frame` when at least one selected instance is a `GuiObject`
+    /// and none is a `BasePart`; otherwise groups into a `Model`.
+    pub fn should_group_as_frame(&self, refs: &[Ref]) -> bool {
+        let mut any_gui = false;
+        for r in self.top_level(refs) {
+            if !self.can_edit_structure(r) {
+                continue;
+            }
+            if let Some(c) = self.class_of(r) {
+                if is_a(&c, "BasePart") {
+                    return false;
+                }
+                if is_a(&c, "GuiObject") {
+                    any_gui = true;
+                }
+            }
+        }
+        any_gui
     }
 
-    /// Groups into a new `class` (Model, or Folder: Studio's Group as Folder).
+    /// Lowest common ancestor of `refs`' parents.
+    fn common_parent(&self, refs: &[Ref]) -> Option<Ref> {
+        let first = *refs.first()?;
+        let mut lca = self.dom.get_by_ref(first)?.parent();
+        for &r in &refs[1..] {
+            let mut p = self.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
+            while lca.is_some() && lca != p && !self.is_ancestor(lca, p) {
+                lca = self.dom.get_by_ref(lca).map(|i| i.parent()).unwrap_or_else(Ref::none);
+            }
+            if lca.is_none() {
+                p = self.dom.get_by_ref(first)?.parent();
+                return Some(p);
+            }
+        }
+        if lca == self.dom.root_ref() || lca.is_none() {
+            Some(self.dom.get_by_ref(first)?.parent())
+        } else {
+            Some(lca)
+        }
+    }
+
+    /// Wraps the instances in a new Frame (if GuiObjects with no BaseParts) or
+    /// Model under their lowest common parent (Studio `GroupSelectionAction`).
+    pub fn group(&mut self, refs: &[Ref]) -> Option<Ref> {
+        let class = if self.should_group_as_frame(refs) { "Frame" } else { "Model" };
+        self.group_as(refs, class)
+    }
+
+    /// Groups into a new `class` (Model, Frame, or Folder: Studio's Group as Folder).
     pub fn group_as(&mut self, refs: &[Ref], class: &str) -> Option<Ref> {
         let top: Vec<Ref> = self
             .top_level(refs)
             .into_iter()
             .filter(|r| self.can_edit_structure(*r))
             .collect();
-        let first = *top.first()?;
-        let parent = self.dom.get_by_ref(first)?.parent();
-        let model = self
-            .dom
-            .insert(parent, InstanceBuilder::new(class).with_name(class));
+        if top.is_empty() {
+            return None;
+        }
+        let parent = self.common_parent(&top)?;
+        let mut builder = InstanceBuilder::new(class).with_name(class);
+        if class == "Frame" {
+            // Studio `GroupSelectionAction`:
+            // default Frame properties (100x100 offset, white bg, 0 border px).
+            use rbx_dom_weak::types::{Color3, UDim, UDim2};
+            builder = builder
+                .with_property("Size", Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100))))
+                .with_property("Position", Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0))))
+                .with_property("BackgroundColor3", Variant::Color3(Color3::new(1.0, 1.0, 1.0)))
+                .with_property("BorderColor3", Variant::Color3(Color3::new(0.0, 0.0, 0.0)))
+                .with_property("BorderSizePixel", Variant::Int32(0))
+                .with_property("BackgroundTransparency", Variant::Float32(0.0))
+                .with_property("Active", Variant::Bool(false))
+                .with_property("LayoutOrder", Variant::Int32(0));
+        }
+        let model = self.dom.insert(parent, builder);
         let mut changes = vec![Change::Create { r: model, parent }];
         for r in top {
             let old = self
@@ -2836,6 +2895,125 @@ mod studio_defaults_tests {
         assert_eq!(d.prop(sky, "MoonTextureId"), id("rbxasset://sky/moon.jpg"), "the omitted moon keeps its default");
         assert_eq!(default_instance_name("DepthOfFieldEffect"), "DepthOfField");
         assert_eq!(default_instance_name("Atmosphere"), "Atmosphere");
+    }
+
+    #[test]
+    fn gui_group_creates_frame_with_studio_defaults_and_lca() {
+        use rbx_dom_weak::types::{Color3, UDim, UDim2};
+        let mut d = Document::new_place();
+        let sg_svc = d.find_child(d.dom.root_ref(), "StarterGui").unwrap();
+        let sg = d.insert(sg_svc, InstanceBuilder::new("ScreenGui").with_name("ScreenGui"));
+        let a = d.insert(sg, InstanceBuilder::new("TextLabel").with_name("A"));
+        let b = d.insert(sg, InstanceBuilder::new("TextButton").with_name("B"));
+
+        assert!(d.should_group_as_frame(&[a, b]));
+        let g = d.group(&[a, b]).expect("grouped into Frame");
+        assert_eq!(d.class_of(g).as_deref(), Some("Frame"));
+        assert_eq!(d.dom.get_by_ref(g).unwrap().parent(), sg);
+        assert_eq!(d.dom.get_by_ref(a).unwrap().parent(), g);
+        assert_eq!(d.dom.get_by_ref(b).unwrap().parent(), g);
+        assert_eq!(d.prop(g, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))));
+        assert_eq!(d.prop(g, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))));
+        assert_eq!(d.prop(g, "BorderSizePixel"), Some(Variant::Int32(0)));
+
+        // Undo restores original parents and removes the grouping Frame.
+        assert!(d.undo().is_some());
+        assert!(!d.exists(g));
+        assert_eq!(d.dom.get_by_ref(a).unwrap().parent(), sg);
+        assert_eq!(d.dom.get_by_ref(b).unwrap().parent(), sg);
+
+        // Redo re-creates the grouping Frame.
+        assert!(d.redo().is_some());
+        assert!(d.exists(g));
+        assert_eq!(d.dom.get_by_ref(a).unwrap().parent(), g);
+        assert_eq!(d.dom.get_by_ref(b).unwrap().parent(), g);
+
+        // Grouping GuiObjects across sibling containers uses their LCA (ScreenGui).
+        let f1 = d.insert(sg, InstanceBuilder::new("Frame").with_name("F1"));
+        let f2 = d.insert(sg, InstanceBuilder::new("Frame").with_name("F2"));
+        let c1 = d.insert(f1, InstanceBuilder::new("TextLabel").with_name("C1"));
+        let c2 = d.insert(f2, InstanceBuilder::new("TextLabel").with_name("C2"));
+        let lca_g = d.group(&[c1, c2]).expect("grouped across frames");
+        assert_eq!(d.class_of(lca_g).as_deref(), Some("Frame"));
+        assert_eq!(d.dom.get_by_ref(lca_g).unwrap().parent(), sg);
+
+        // Mixed selection (GuiObject + BasePart) groups into a Model.
+        let ws = d.workspace().unwrap();
+        let part = d.insert(ws, InstanceBuilder::new("Part").with_name("P"));
+        assert!(!d.should_group_as_frame(&[c1, part]));
+        let mixed = d.group(&[c1, part]).expect("mixed group");
+        assert_eq!(d.class_of(mixed).as_deref(), Some("Model"));
+    }
+
+    #[test]
+    fn gui_copy_paste_duplicate_delete_rename_reparent_and_udim2_undo() {
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut d = Document::new_place();
+        let sg_svc = d.find_child(d.dom.root_ref(), "StarterGui").unwrap();
+        let sg1 = d.insert(sg_svc, InstanceBuilder::new("ScreenGui").with_name("Gui1"));
+        let sg2 = d.insert(sg_svc, InstanceBuilder::new("ScreenGui").with_name("Gui2"));
+        let pos0 = UDim2::new(UDim::new(0.25, 12), UDim::new(0.5, -8));
+        let size0 = UDim2::new(UDim::new(0.1, 120), UDim::new(0.0, 44));
+        let btn = d.insert(
+            sg1,
+            InstanceBuilder::new("TextButton")
+                .with_name("PlayBtn")
+                .with_property("Position", Variant::UDim2(pos0))
+                .with_property("Size", Variant::UDim2(size0)),
+        );
+
+        // Duplicate: same parent, same name, exact same Position (no offset in Studio).
+        let dups = d.duplicate(&[btn]);
+        assert_eq!(dups.len(), 1);
+        let dup = dups[0];
+        assert_eq!(d.dom.get_by_ref(dup).unwrap().parent(), sg1);
+        assert_eq!(d.dom.get_by_ref(dup).unwrap().name, "PlayBtn");
+        assert_eq!(d.prop(dup, "Position"), Some(Variant::UDim2(pos0)));
+        assert_eq!(d.prop(dup, "Size"), Some(Variant::UDim2(size0)));
+        assert!(d.undo().is_some());
+        assert!(!d.exists(dup));
+
+        // Copy + Paste Into another ScreenGui preserves name and UDim2 values.
+        let bytes = d.copy(&[btn]).expect("copy gui");
+        let pasted = d.paste(&bytes, sg2, "Paste");
+        assert_eq!(pasted.len(), 1);
+        let p = pasted[0];
+        assert_eq!(d.dom.get_by_ref(p).unwrap().parent(), sg2);
+        assert_eq!(d.dom.get_by_ref(p).unwrap().name, "PlayBtn");
+        assert_eq!(d.prop(p, "Position"), Some(Variant::UDim2(pos0)));
+        assert!(d.undo().is_some());
+        assert!(!d.exists(p));
+
+        // Rename + undo/redo.
+        d.rename(btn, "StartBtn");
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().name, "StartBtn");
+        assert!(d.undo().is_some());
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().name, "PlayBtn");
+        assert!(d.redo().is_some());
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().name, "StartBtn");
+
+        // Drag-reparent between ScreenGuis + undo.
+        assert_eq!(d.reparent(&[btn], sg2), 1);
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().parent(), sg2);
+        assert!(d.undo().is_some());
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().parent(), sg1);
+
+        // Property edit of UDim2 + undo/redo restores exact UDim2 values.
+        let pos1 = UDim2::new(UDim::new(0.75, -30), UDim::new(0.125, 42));
+        d.set_props("Set Position", vec![(btn, ustr("Position"), Variant::UDim2(pos1))], None);
+        assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos1)));
+        assert!(d.undo().is_some());
+        assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos0)));
+        assert!(d.redo().is_some());
+        assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos1)));
+
+        // Delete + undo restores GuiObject with its exact UDim2.
+        assert_eq!(d.remove(&[btn]), 1);
+        assert!(!d.exists(btn));
+        assert!(d.undo().is_some());
+        assert!(d.exists(btn));
+        assert_eq!(d.dom.get_by_ref(btn).unwrap().parent(), sg1);
+        assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos1)));
     }
 }
 

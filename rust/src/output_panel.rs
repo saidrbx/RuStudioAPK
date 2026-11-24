@@ -219,6 +219,7 @@ pub struct OutputState {
     pub show_timestamp: bool,
     pub show_context: bool,
     pub show_source: bool,
+    pub wrap_text: bool,
     pub sel: OutputSelection,
     rows: OutputRows,
     pub(crate) log_generation: u64,
@@ -232,8 +233,13 @@ struct OutputRows {
     tops: Vec<f32>,
     height: f32,
     row_height: f32,
-    /// The widest line drawn so far (the content's width: long lines
-    /// scroll sideways, as Studio's Output does).
+    /// Active wrap width when `wrap_text` is enabled, else `None`.
+    wrap_width: Option<f32>,
+    /// Line-format flags that affect rendered width when wrapping.
+    line_opts: (bool, bool, bool),
+    pixels_per_point: f32,
+    /// The widest line drawn so far (the content's width when not wrapping:
+    /// long lines scroll sideways, as Studio's Output does).
     width: f32,
 }
 
@@ -277,6 +283,7 @@ impl Default for OutputState {
             show_timestamp: false,
             show_context: false,
             show_source: true,
+            wrap_text: true,
             sel: OutputSelection::default(),
             rows: OutputRows::default(),
             log_generation: 0,
@@ -375,6 +382,7 @@ impl Editor {
                     ui.checkbox(&mut st.show_timestamp, "Show Timestamp");
                     ui.checkbox(&mut st.show_context, "Show Context");
                     ui.checkbox(&mut st.show_source, "Show Source");
+                    ui.checkbox(&mut st.wrap_text, "Wrap Text");
                     // Studio Settings > Output > Clear Output On Start (the same setting).
                     let mut clear = crate::studio_settings::flag("Studio", "Clear Output On Start", true);
                     if ui.checkbox(&mut clear, "Clear On Play").changed() {
@@ -415,187 +423,250 @@ impl Editor {
 pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usize {
     let row_height = line_h();
     let mut index = std::mem::take(&mut st.rows);
-    let same_filter = index.filter.as_ref().is_some_and(|(messages, contexts, text)| {
-        *messages == st.messages && *contexts == st.contexts && *text == st.filter
-    });
-    if !same_filter || index.indexed > log.len() || index.row_height != row_height {
-        index.clear();
-        index.filter = Some((st.messages, st.contexts, st.filter.clone()));
-    }
-    index.row_height = row_height;
-    index.tops.pop();
-    if index.indexed < log.len() {
-        // Appends only inspect new messages. Clearing or draining the log
-        // invalidates the index, as do the filters and Output Font.
-        let filter = st.filter.to_lowercase();
-        let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && filter.is_empty();
-        for (i, line) in log.iter().enumerate().skip(index.indexed) {
-            if unfiltered || wanted(st, &filter, &parse(line), line) {
-                index.shown.push(i);
-                index.tops.push(index.height);
-                index.height += row_height * (line.text.matches('\n').count() + 1) as f32;
-            }
-        }
-        index.indexed = log.len();
-    }
-    index.tops.push(index.height);
-    let (shown, tops) = (&index.shown, &index.tops);
     let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
     let id = egui::Id::new("output_text");
     let mut drawn = 0;
-    let mut widest = index.width;
-    egui::ScrollArea::both()
+    let mut scroll = egui::ScrollArea::new([!st.wrap_text, true])
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show_viewport(ui, |ui, viewport| {
-            let total = *tops.last().unwrap_or(&0.0);
-            let (content, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(widest), total), Sense::hover());
-            let view = ui.clip_rect();
-            // Under the lines (they only sense hover), above nothing: the
-            // scroll bar is added after and stays on top.
-            let resp = ui.interact(view, id, Sense::click_and_drag());
-            let first = tops.partition_point(|&t| t <= viewport.min.y).saturating_sub(1);
-            let last = tops.partition_point(|&t| t < viewport.max.y).min(shown.len());
-            let space = ui.fonts_mut(|f| f.glyph_width(&mono_font(), ' '));
-            // Each drawn message: log index, its top, where its text starts,
-            // its layout, and a slot for the selection painted under it.
-            let mut rows = Vec::new();
-            for k in first..last {
-                let i = shown[k];
-                let l = &log[i];
-                let s = parse(l);
-                let galley = ui.fonts_mut(|f| f.layout_job(line_job(st, l, &s)));
-                let top = content.min.y + tops[k];
-                // One monospace space wide, then one more space.
-                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, row_height));
-                let bar_color = match s.context {
-                    Context::Server => Some(SERVER_BAR),
-                    Context::Client => Some(CLIENT_BAR),
-                    Context::None => None,
-                };
-                if let Some(c) = bar_color {
-                    ui.painter().rect_filled(bar, 0.0, c);
-                }
-                let slot = ui.painter().add(egui::Shape::Noop);
-                // (as the earlier row layout spaced them: bar, gap, space, gap)
-                let pos = egui::pos2(content.min.x + 2.0 * space + 2.0 * ui.spacing().item_spacing.x, top);
-                ui.painter().galley(pos, galley.clone(), PRINT);
-                widest = widest.max(pos.x - content.min.x + galley.size().x + space);
-                rows.push((i, tops[k + 1] - tops[k], top, pos, galley, slot, space));
-                drawn += 1;
-            }
-            if resp.hovered() {
-                ui.set_cursor_icon(egui::CursorIcon::Text);
-            }
+        .stick_to_bottom(true);
+    if st.wrap_text {
+        scroll = scroll.horizontal_scroll_offset(0.0);
+    }
+    scroll.show_viewport(ui, |ui, viewport| {
+        let space = ui.fonts_mut(|f| f.glyph_width(&mono_font(), ' '));
+        let text_indent = 2.0 * space + 2.0 * ui.spacing().item_spacing.x;
+        let avail_w = ui.available_width();
+        let mut wrap_width = st.wrap_text.then(|| (avail_w - text_indent - space).max(space * 2.0).floor());
+        // While the panel is being resized (a button held), keep the last
+        // wrap width: re-wrapping a long log at every intermediate width is a
+        // full layout pass per frame. It re-wraps once on release.
+        if wrap_width.is_some() && index.wrap_width.is_some() && ui.ctx().input(|i| i.pointer.any_down()) {
+            wrap_width = index.wrap_width;
+        }
+        let line_opts = (st.show_timestamp, st.show_context, st.show_source);
+        let pixels_per_point = ui.ctx().pixels_per_point();
 
-            // Pointer → (line, char) on the lines drawn this frame;
-            // above / below them clamps to the first / last.
-            let at = |p: egui::Pos2| -> Option<TextPos> {
-                let (first, last) = (rows.first()?, rows.last()?);
-                if p.y < first.2 {
-                    return Some((first.0, 0));
-                }
-                let row = rows.iter().rev().find(|r| p.y >= r.2).unwrap_or(last);
-                if p.y >= row.2 + row.1 && std::ptr::eq(row, last) {
-                    return Some((row.0, row.4.text().chars().count()));
-                }
-                let c = row.4.cursor_from_pos(p - row.3).index.0;
-                Some((row.0, c))
-            };
-            let (pressed, down, ptr, now, shift) = ui.input(|i| {
-                (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift)
-            });
-            let text_on = |line: usize| rows.iter().find(|r| r.0 == line).map(|r| r.4.text().to_string());
-            let sel = &mut st.sel;
-            let hit = ptr.and_then(|p| at(p).map(|c| (p, c)));
-            if let (true, Some((p, c))) = (pressed && resp.hovered(), hit) {
-                ui.memory_mut(|m| m.request_focus(id));
-                let count = match sel.press {
-                    Some((t, q, n)) if now - t < 0.4 && q.distance(p) < 6.0 => n % 3 + 1,
-                    _ => 1,
-                };
-                sel.press = Some((now, p, count));
-                let text = text_on(c.0).unwrap_or_default();
-                let (a, b) = match count {
-                    1 if shift => (sel.anchor, c),
-                    1 => (c, c),
-                    2 => word_at(&text, c),
-                    _ => line_at(&text, c),
-                };
-                sel.anchor = a;
-                sel.head = b;
-                sel.drag = Some((count, a, b));
-                if count == 1 && shift {
-                    sel.drag = Some((1, a, a));
-                }
-            } else if let (true, Some((mode, a, b)), Some((p, c))) = (down, sel.drag, hit) {
-                // Dragging: grow by chars, words or lines from the press.
-                let (h0, h1) = match mode {
-                    1 => (c, c),
-                    2 => word_at(&text_on(c.0).unwrap_or_default(), c),
-                    _ => line_at(&text_on(c.0).unwrap_or_default(), c),
-                };
-                (sel.anchor, sel.head) = if mode == 1 {
-                    (a, c)
-                } else if h0 < a {
-                    (b, h0)
-                } else {
-                    (a, h1.max(b))
-                };
-                // Past the top / bottom edge: scroll along.
-                let dy = if p.y < view.top() {
-                    view.top() - p.y
-                } else if p.y > view.bottom() {
-                    view.bottom() - p.y
-                } else {
-                    0.0
-                };
-                if dy != 0.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-row_height * 2.0, row_height * 2.0)));
-                    ui.ctx().request_repaint();
-                }
-            }
-            if !down {
-                sel.drag = None;
-            }
-            // Clicking anywhere else gives the keyboard back.
-            if ui.input(|i| i.pointer.any_pressed()) && !resp.hovered() && ui.memory(|m| m.has_focus(id)) {
-                ui.memory_mut(|m| m.surrender_focus(id));
-            }
-
-            // Paint the selection under each drawn line.
-            let (lo, hi) = if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) };
-            if lo != hi {
-                let fill = ui.visuals().selection.bg_fill;
-                for (i, _, top, pos, galley, slot, space) in &rows {
-                    if *i < lo.0 || *i > hi.0 {
-                        continue;
-                    }
-                    let n = galley.text().chars().count();
-                    let a = if *i == lo.0 { lo.1.min(n) } else { 0 };
-                    let b = if *i == hi.0 { hi.1.min(n) } else { n };
-                    let x = |c: usize| pos.x + galley.pos_from_cursor(egui::text::CCursor::new(c)).min.x;
-                    // One rect per line of the message; a selection running on
-                    // past a line covers its line break too.
-                    let mut shapes = Vec::new();
-                    let mut start = 0;
-                    for (k, seg) in galley.text().split('\n').enumerate() {
-                        let len = seg.chars().count();
-                        let (sa, sb) = (a.max(start), b.min(start + len));
-                        let runs_on = b > start + len && (start + len < n || *i < hi.0);
-                        if sa <= sb && (sa < sb || runs_on) {
-                            let y = top + row_height * k as f32;
-                            let end = x(sb) + if runs_on { *space } else { 0.0 };
-                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + row_height));
-                            shapes.push(egui::Shape::rect_filled(r, 0.0, fill));
-                        }
-                        start += len + 1;
-                    }
-                    ui.painter().set(*slot, egui::Shape::Vec(shapes));
-                }
-            }
+        let same_filter = index.filter.as_ref().is_some_and(|(messages, contexts, text)| {
+            *messages == st.messages && *contexts == st.contexts && *text == st.filter
         });
+        let same_wrap = index.wrap_width == wrap_width
+            && (wrap_width.is_none() || (index.line_opts == line_opts && index.pixels_per_point == pixels_per_point));
+        if !same_filter || !same_wrap || index.indexed > log.len() || index.row_height != row_height {
+            index.clear();
+            index.filter = Some((st.messages, st.contexts, st.filter.clone()));
+        }
+        index.row_height = row_height;
+        index.wrap_width = wrap_width;
+        index.line_opts = line_opts;
+        index.pixels_per_point = pixels_per_point;
+        index.tops.pop();
+        if index.indexed < log.len() {
+            // Appends only inspect new messages. Clearing or draining the log
+            // invalidates the index, as do the filters, Output Font, wrap width,
+            // and (when wrapping) the line prefix/suffix options.
+            let filter = st.filter.to_lowercase();
+            let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && filter.is_empty();
+            let max_ascii_w = if wrap_width.is_some() {
+                let mono_w = ui.fonts_mut(|f| f.glyph_width(&mono_font(), 'W'));
+                let bold_w = ui.fonts_mut(|f| {
+                    f.glyph_width(&FontId::new(mono_px(), egui::FontFamily::Name("mono-bold".into())), 'W')
+                });
+                mono_w.max(bold_w).max(space)
+            } else {
+                0.0
+            };
+            for (i, line) in log.iter().enumerate().skip(index.indexed) {
+                let parsed = parse(line);
+                if unfiltered || wanted(st, &filter, &parsed, line) {
+                    index.shown.push(i);
+                    index.tops.push(index.height);
+                    let h = match wrap_width {
+                        None => row_height * (line.text.matches('\n').count() + 1) as f32,
+                        Some(w) => {
+                            let mut job = line_job(st, line, &parsed);
+                            let single = !job.text.bytes().any(|b| b < 0x20 || b >= 0x80)
+                                && (job.text.len() as f32) * max_ascii_w + 1.0 <= w;
+                            if single {
+                                row_height
+                            } else {
+                                job.wrap.max_width = w;
+                                ui.fonts_mut(|f| f.layout_job(job)).size().y.max(row_height)
+                            }
+                        }
+                    };
+                    index.height += h;
+                }
+            }
+            index.indexed = log.len();
+        }
+        index.tops.push(index.height);
 
+        let (shown, tops) = (&index.shown, &index.tops);
+        let mut widest = index.width;
+        let total = *tops.last().unwrap_or(&0.0);
+        let content_w = if st.wrap_text { avail_w } else { avail_w.max(widest) };
+        let (content, _) = ui.allocate_exact_size(Vec2::new(content_w, total), Sense::hover());
+        let view = ui.clip_rect();
+        // Under the lines (they only sense hover), above nothing: the
+        // scroll bar is added after and stays on top.
+        let resp = ui.interact(view, id, Sense::click_and_drag());
+        let first = tops.partition_point(|&t| t <= viewport.min.y).saturating_sub(1);
+        let last = tops.partition_point(|&t| t < viewport.max.y).min(shown.len());
+        // Each drawn message: log index, its height, its top, where its text starts,
+        // its layout, and a slot for the selection painted under it.
+        let mut rows = Vec::new();
+        for k in first..last {
+            let i = shown[k];
+            let l = &log[i];
+            let s = parse(l);
+            let mut job = line_job(st, l, &s);
+            if let Some(w) = wrap_width {
+                job.wrap.max_width = w;
+            }
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let top = content.min.y + tops[k];
+            // One monospace space wide, then one more space.
+            let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, row_height));
+            let bar_color = match s.context {
+                Context::Server => Some(SERVER_BAR),
+                Context::Client => Some(CLIENT_BAR),
+                Context::None => None,
+            };
+            if let Some(c) = bar_color {
+                ui.painter().rect_filled(bar, 0.0, c);
+            }
+            let slot = ui.painter().add(egui::Shape::Noop);
+            // (as the earlier row layout spaced them: bar, gap, space, gap)
+            let pos = egui::pos2(content.min.x + text_indent, top);
+            ui.painter().galley(pos, galley.clone(), PRINT);
+            if !st.wrap_text {
+                widest = widest.max(pos.x - content.min.x + galley.size().x + space);
+            }
+            rows.push((i, tops[k + 1] - tops[k], top, pos, galley, slot, space));
+            drawn += 1;
+        }
+        index.width = widest;
+        if resp.hovered() {
+            ui.set_cursor_icon(egui::CursorIcon::Text);
+        }
+
+        // Pointer → (line, char) on the lines drawn this frame;
+        // above / below them clamps to the first / last.
+        let at = |p: egui::Pos2| -> Option<TextPos> {
+            let (first, last) = (rows.first()?, rows.last()?);
+            if p.y < first.2 {
+                return Some((first.0, 0));
+            }
+            let row = rows.iter().rev().find(|r| p.y >= r.2).unwrap_or(last);
+            if p.y >= row.2 + row.1 && std::ptr::eq(row, last) {
+                return Some((row.0, row.4.text().chars().count()));
+            }
+            let c = row.4.cursor_from_pos(p - row.3).index.0;
+            Some((row.0, c))
+        };
+        let (pressed, down, ptr, now, shift) = ui.input(|i| {
+            (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift)
+        });
+        let text_on = |line: usize| rows.iter().find(|r| r.0 == line).map(|r| r.4.text().to_string());
+        let sel = &mut st.sel;
+        let hit = ptr.and_then(|p| at(p).map(|c| (p, c)));
+        if let (true, Some((p, c))) = (pressed && resp.hovered(), hit) {
+            ui.memory_mut(|m| m.request_focus(id));
+            let count = match sel.press {
+                Some((t, q, n)) if now - t < 0.4 && q.distance(p) < 6.0 => n % 3 + 1,
+                _ => 1,
+            };
+            sel.press = Some((now, p, count));
+            let text = text_on(c.0).unwrap_or_default();
+            let (a, b) = match count {
+                1 if shift => (sel.anchor, c),
+                1 => (c, c),
+                2 => word_at(&text, c),
+                _ => line_at(&text, c),
+            };
+            sel.anchor = a;
+            sel.head = b;
+            sel.drag = Some((count, a, b));
+            if count == 1 && shift {
+                sel.drag = Some((1, a, a));
+            }
+        } else if let (true, Some((mode, a, b)), Some((p, c))) = (down, sel.drag, hit) {
+            // Dragging: grow by chars, words or lines from the press.
+            let (h0, h1) = match mode {
+                1 => (c, c),
+                2 => word_at(&text_on(c.0).unwrap_or_default(), c),
+                _ => line_at(&text_on(c.0).unwrap_or_default(), c),
+            };
+            (sel.anchor, sel.head) = if mode == 1 {
+                (a, c)
+            } else if h0 < a {
+                (b, h0)
+            } else {
+                (a, h1.max(b))
+            };
+            // Past the top / bottom edge: scroll along.
+            let dy = if p.y < view.top() {
+                view.top() - p.y
+            } else if p.y > view.bottom() {
+                view.bottom() - p.y
+            } else {
+                0.0
+            };
+            if dy != 0.0 {
+                ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-row_height * 2.0, row_height * 2.0)));
+                ui.ctx().request_repaint();
+            }
+        }
+        if !down {
+            sel.drag = None;
+        }
+        // Clicking anywhere else gives the keyboard back.
+        if ui.input(|i| i.pointer.any_pressed()) && !resp.hovered() && ui.memory(|m| m.has_focus(id)) {
+            ui.memory_mut(|m| m.surrender_focus(id));
+        }
+
+        // Paint the selection under each drawn line.
+        let (lo, hi) = if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) };
+        if lo != hi {
+            let fill = ui.visuals().selection.bg_fill;
+            for (i, _, _top, pos, galley, slot, space) in &rows {
+                if *i < lo.0 || *i > hi.0 {
+                    continue;
+                }
+                let n = galley.text().chars().count();
+                let a = if *i == lo.0 { lo.1.min(n) } else { 0 };
+                let b = if *i == hi.0 { hi.1.min(n) } else { n };
+                // One rect per visual row of the message; a selection running
+                // past an explicit line break covers its break too.
+                let mut shapes = Vec::new();
+                let mut start = 0;
+                let last_row = galley.rows.len().saturating_sub(1);
+                for (k, row) in galley.rows.iter().enumerate() {
+                    let len = row.char_count_excluding_newline().0;
+                    let (sa, sb) = (a.max(start), b.min(start + len));
+                    let runs_on = if row.ends_with_newline {
+                        b > start + len
+                    } else {
+                        k == last_row && *i < hi.0
+                    };
+                    if sa <= sb && (sa < sb || runs_on) {
+                        let x0 = pos.x + row.pos.x + row.x_offset(egui::text::CharIndex(sa - start));
+                        let x1 = pos.x + row.pos.x + row.x_offset(egui::text::CharIndex(sb - start))
+                            + if runs_on { *space } else { 0.0 };
+                        let r = egui::Rect::from_min_max(
+                            egui::pos2(x0, pos.y + row.min_y()),
+                            egui::pos2(x1, pos.y + row.max_y()),
+                        );
+                        shapes.push(egui::Shape::rect_filled(r, 0.0, fill));
+                    }
+                    start += row.char_count_including_newline().0;
+                }
+                ui.painter().set(*slot, egui::Shape::Vec(shapes));
+            }
+        }
+    });
+
+    let shown = &index.shown;
     // Keys while the Output has the keyboard: Ctrl+A, Ctrl+C, Esc.
     if ui.memory(|m| m.has_focus(id)) {
         let (all, copy, esc) = ui.input_mut(|i| {
@@ -630,7 +701,6 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             }
         }
     }
-    index.width = widest;
     st.rows = index;
     drawn
 }
@@ -676,6 +746,7 @@ mod tests {
     struct View {
         ctx: egui::Context,
         t: f64,
+        width: f32,
         st: OutputState,
         log: Vec<LogLine>,
         copied: Option<String>,
@@ -690,7 +761,7 @@ mod tests {
             ];
             let ctx = egui::Context::default();
             rustudio_engine::ti::install(&ctx);
-            let mut v = View { ctx, t: 0.0, st: OutputState::default(), log, copied: None };
+            let mut v = View { ctx, t: 0.0, width: 800.0, st: OutputState::default(), log, copied: None };
             v.frame(vec![]);
             v.frame(vec![]);
             v
@@ -699,7 +770,7 @@ mod tests {
             let input = egui::RawInput {
                 time: Some(self.t),
                 events,
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 300.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(self.width, 300.0))),
                 ..Default::default()
             };
             let (st, log) = (&mut self.st, &self.log);
@@ -859,5 +930,54 @@ mod tests {
         v.drag(p, q);
         v.btn(q, false);
         assert_eq!(v.copy(), "top\nbanner mid\nbanner end - D:4\nsecond");
+    }
+
+    #[test]
+    fn wrapping_defaults_on_and_updates_layout_and_selection() {
+        let mut v = View::new();
+        assert!(v.st.wrap_text);
+        v.log = vec![
+            line(Level::Info, "alpha beta gamma delta epsilon zeta eta theta iota kappa"),
+            line(Level::Info, "after wrap"),
+        ];
+        v.st.log_cleared();
+        v.width = 220.0;
+        v.frame(vec![]);
+        v.frame(vec![]);
+
+        let row_h = v.st.rows.row_height;
+        let first_h = v.st.rows.tops[1] - v.st.rows.tops[0];
+        let wrapped_rows = (first_h / row_h).round() as usize;
+        assert!(wrapped_rows >= 2, "expected long line to wrap at 220px, got height {first_h} (row_h {row_h})");
+        assert_eq!(v.st.rows.width, 0.0, "wrapping should not grow horizontal content width");
+
+        // Drag from row 0 across the wrapped visual rows into the second log line.
+        let p = v.at(0, 6);
+        let q = v.at(wrapped_rows, 5);
+        v.frame(vec![egui::Event::PointerMoved(p)]);
+        v.btn(p, true);
+        v.drag(p, q);
+        v.btn(q, false);
+        assert_eq!(
+            v.copy(),
+            "beta gamma delta epsilon zeta eta theta iota kappa\nafter",
+        );
+
+        // Enabling timestamps while wrapped rebuilds heights to fit the longer prefix.
+        v.st.show_timestamp = true;
+        v.frame(vec![]);
+        assert!(v.st.rows.tops[1] >= first_h);
+
+        // Widening the panel reduces the wrapped height back to a single row per line.
+        v.width = 900.0;
+        v.frame(vec![]);
+        assert_eq!(v.st.rows.tops[1] - v.st.rows.tops[0], row_h);
+
+        // Turning wrapping off keeps long lines on a single row and tracks horizontal width.
+        v.width = 220.0;
+        v.st.wrap_text = false;
+        v.frame(vec![]);
+        assert_eq!(v.st.rows.tops[1] - v.st.rows.tops[0], row_h);
+        assert!(v.st.rows.width > 220.0);
     }
 }

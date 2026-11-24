@@ -4,6 +4,7 @@
 // Camera
 // Bounded first-viewport diagnostics for the Android compatibility profile.
 pub const MOBILE_SCRIPT_SHEET_FRACTION: f32 = 0.75;
+pub const MOBILE_EXPLORER_WIDTH_FRACTION: f32 = 0.27;
 pub const MOBILE_SCRIPT_MIN_FONT: f32 = 14.0;
 pub const MOBILE_GPU_DIAGNOSTIC_FRAMES: usize = 3;
 pub const MOBILE_GPU_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;

@@ -104,6 +104,11 @@ pub struct UiState {
     pub popped_class: Option<egui::ViewportClass>,
     pub zoom: f32,
     pub show_gui: bool,
+    pub show_core_gui: bool,
+    /// The saved Core UI choice while `--show-core-ui` / `--no-core-ui`
+    /// overrides it for this run, so the override isn't written back to the
+    /// layout. A toggle in the session drops it.
+    pub show_core_gui_saved: Option<bool>,
     pub show_view_selector: bool,
     pub grid_size: f32,
     pub about: bool,
@@ -128,6 +133,8 @@ impl Default for UiState {
             popped_class: None,
             zoom: 1.0,
             show_gui: true,
+            show_core_gui: true,
+            show_core_gui_saved: None,
             show_view_selector: true,
             grid_size: rustudio_core::mech::GRID_SPACING,
             about: false,
@@ -275,6 +282,7 @@ pub const VIEW: &[M] = &[
     I("Show Grid Material", "", "grid_material"),
     I("Show Wireframe Rendering", "", "wireframe"),
     I("Show UI", "", "show_ui"),
+    I("Show Core UI", "", "show_core_ui"),
     S,
     I("Show Welds", "Alt+W", "show_welds"),
     I("Show Constraint Details", "Alt+D", "constraint_details"),

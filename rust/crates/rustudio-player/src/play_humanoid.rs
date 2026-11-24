@@ -307,6 +307,32 @@ impl Game {
         rig::write_pose(&mut self.doc, &pose, None);
     }
 
+    /// An R6 rig's leg length for its full hip (the taller of Left Leg and
+    /// Right Leg), read where the character is simulated: the owning
+    /// client's copy when it has one. Studio's network owner steps its
+    /// character with its own DataModel, so legs a LocalScript builds there
+    /// count (a server character that is a Torso and a root; the client
+    /// adds the limbs): read on the server, there were none, the full hip
+    /// came out 2 studs short and the character sank to its torso.
+    fn owned_r6_legs(&self, model: Ref) -> f32 {
+        let legs = |d: &Document, m: Ref| {
+            ["Left Leg", "Right Leg"]
+                .iter()
+                .filter_map(|n| d.find_named(m, n))
+                .filter_map(|r| rustudio_render::scene::vec3_of(d.prop(r, "Size")))
+                .map(|s| s.y)
+                .fold(0.0f32, f32::max)
+        };
+        let client = self
+            .play
+            .as_ref()
+            .and_then(|s| s.other_doc.as_ref().zip(s.map.s2c.get(&model).copied()));
+        match client {
+            Some((cd, cm)) => legs(cd, cm),
+            None => legs(&self.doc, model),
+        }
+    }
+
     /// The client's CurrentCamera: its CFrame and Focus.
     fn client_camera(&self) -> Option<(Xform, Option<Xform>)> {
         let cd = self.play.as_ref()?.other_doc.as_ref()?;
@@ -518,16 +544,7 @@ impl Game {
                 && seat_root.is_none()
                 && rustudio_engine::runtime::domains::world::part::with_graph(&self.doc, |g| g.grounded(&self.doc, root)));
         let hip_height = self.owned_humanoid_f32(humanoid, "HipHeight", 0.0);
-        let legs = if rig_type == RigType::R6 {
-            ["Left Leg", "Right Leg"]
-                .iter()
-                .filter_map(|n| self.doc.find_named(model, n))
-                .filter_map(|r| rustudio_render::scene::vec3_of(self.doc.prop(r, "Size")))
-                .map(|s| s.y)
-                .fold(0.0f32, f32::max)
-        } else {
-            0.0
-        };
+        let legs = if rig_type == RigType::R6 { self.owned_r6_legs(model) } else { 0.0 };
         let s = self.play.as_mut().expect("playing");
         s.physics.sync_gravity(&self.doc);
         let doc = &self.doc;
@@ -1391,6 +1408,112 @@ mod script_moves_player_character_tests {
             }
         }
         assert!(client_since.is_some(), "the client never had the server's CFrame");
+    }
+
+    /// A player-owned R6 character whose legs exist only on its client
+    /// (e.g. the server's character is a Torso and a root, a
+    /// LocalScript builds the limbs) stands on those legs, as in Studio,
+    /// where the owning client simulates its character with its own
+    /// DataModel. The full hip was read from the server's copy: no legs,
+    /// 2 studs short, and the character stood on its torso. Walking, those
+    /// legs are posed on the torso before PostSimulation (they read a frame
+    /// behind it, 0.37 studs here).
+    #[test]
+    fn r6_legs_only_the_owning_client_has_hold_the_character_up() {
+        let mut game = Game::new(None);
+        game.play_rig = Some(rustudio_engine::rig::RigType::R6);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        let height = |game: &mut Game| {
+            game.run_luau(Side::Client, r#"
+                local ch = game.Players.LocalPlayer.Character
+                local root = ch.HumanoidRootPart
+                local params = RaycastParams.new()
+                params.FilterDescendantsInstances = {ch}
+                local hit = workspace:Raycast(root.Position, Vector3.new(0, -20, 0), params)
+                error(string.format("height %.3f", root.Position.Y - hit.Position.Y))
+            "#)
+            .and_then(|e| e.split("height ").nth(1).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f32>().ok()))
+            .expect("height")
+        };
+        let before = height(&mut game);
+        assert!((before - 3.0).abs() < 0.2, "R6 root {before} studs over the floor at the start");
+        // The server drops the legs; the client puts its own back.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local ch = game:GetService("Players"):GetPlayers()[1].Character
+                ch["Left Leg"]:Destroy()
+                ch["Right Leg"]:Destroy()
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 10);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local ch = game.Players.LocalPlayer.Character
+                assert(not ch:FindFirstChild("Left Leg"), "the server's removal didn't replicate")
+                for _, side in {{"Left", -1}, {"Right", 1}} do
+                    local leg = Instance.new("Part")
+                    leg.Name = side[1] .. " Leg"
+                    leg.Size = Vector3.new(1, 2, 1)
+                    leg.CanCollide = false
+                    local hip = Instance.new("Motor6D")
+                    hip.Name = side[1] .. " Hip"
+                    hip.Part0 = ch.Torso
+                    hip.Part1 = leg
+                    hip.C0 = CFrame.new(side[2] * 0.5, -1, 0)
+                    hip.C1 = CFrame.new(0, 1, 0)
+                    leg.Parent = ch
+                    hip.Parent = ch.Torso
+                    if side[1] == "Left" then _G.leftHip = hip end
+                end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 180);
+        let after = height(&mut game);
+        assert!((after - 3.0).abs() < 0.2, "R6 root {after} studs over the floor on client-only legs (3 with legs)");
+        // Walking, the client-only legs are where their hips put them when
+        // PostSimulation (Heartbeat) reads them (they lagged the torso by a
+        // frame of motion: 0.27 studs at 16 studs/s).
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local RS = game:GetService("RunService")
+                local ch = game.Players.LocalPlayer.Character
+                local hip = _G.leftHip
+                _G.worst, _G.fast, _G.calls, _G.start = 0, 0, 0, ch.HumanoidRootPart.Position
+                local function check()
+                    _G.calls += 1
+                    local want = hip.Part0.CFrame * hip.C0 * hip.Transform * hip.C1:Inverse()
+                    _G.worst = math.max(_G.worst, (want.Position - hip.Part1.Position).Magnitude)
+                    if ch.HumanoidRootPart.AssemblyLinearVelocity.Magnitude > 8 then _G.fast += 1 end
+                end
+                RS.PostSimulation:Connect(function()
+                    local ok, e = pcall(check)
+                    if not ok then _G.err = e end
+                end)
+                ch.Humanoid:MoveTo(ch.HumanoidRootPart.Position + Vector3.new(0, 0, -200))
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 90);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                assert(not _G.err, _G.err)
+                assert(_G.fast > 30, "the character didn't walk: " .. _G.fast .. " of " .. _G.calls .. " moved " .. tostring(game.Players.LocalPlayer.Character.HumanoidRootPart.Position - _G.start))
+                assert(_G.worst < 0.02, string.format("Left Leg %.3f studs off its hip while walking", _G.worst))
+            "#),
+            None
+        );
     }
 
     #[test]

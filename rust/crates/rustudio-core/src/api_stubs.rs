@@ -865,7 +865,7 @@ pub static STUBS: [Stub; 4618] = [
     Stub { class: "PlayerGui", member: "TopbarTransparencyChangedSignal", kind: Kind::Event, read_only: false, default: "" },
     Stub { class: "StarterGui", member: "ResetPlayerGuiOnSpawn", kind: Kind::Property, read_only: false, default: "false" },
     Stub { class: "StarterGui", member: "ScreenOrientation", kind: Kind::Property, read_only: false, default: "Enum.ScreenOrientation.LandscapeLeft" },
-    Stub { class: "StarterGui", member: "ShowDevelopmentGui", kind: Kind::Property, read_only: false, default: "false" },
+    Stub { class: "StarterGui", member: "ShowDevelopmentGui", kind: Kind::Property, read_only: false, default: "true" },
     Stub { class: "StarterGui", member: "GetCoreGuiEnabled", kind: Kind::Function, read_only: false, default: "false" },
     Stub { class: "StarterGui", member: "SetCore", kind: Kind::Function, read_only: false, default: "nil" },
     Stub { class: "StarterGui", member: "SetCoreGuiEnabled", kind: Kind::Function, read_only: false, default: "nil" },

@@ -266,8 +266,9 @@ impl Game {
     /// True while either the legacy fallback menu or Roblox CoreScripts' menu
     /// (`GuiService:SetMenuIsOpen` / inspect menu) is open.
     pub fn any_menu_open(&self) -> bool {
-        self.play.as_ref().is_some_and(|s| s.game.menu_open)
-            || rustudio_engine::gui::share().core_menu_open
+        self.show_core_gui
+            && (self.play.as_ref().is_some_and(|s| s.game.menu_open)
+                || rustudio_engine::gui::share().core_menu_open)
     }
 
     pub fn update_game_mouse(
@@ -299,8 +300,8 @@ impl Game {
         // An editor dialog (egui Modal: "Discard unsaved changes?", …) frees
         // it the same way, so its buttons can be clicked during first person
         // or shift lock; the game's grab comes back when the dialog closes.
-        let core_menu = rustudio_engine::gui::share().core_menu_open;
-        let menu = menu || core_menu || ctx.memory(|m| m.top_modal_layer()).is_some();
+        let core_menu = self.show_core_gui && rustudio_engine::gui::share().core_menu_open;
+        let menu = (self.show_core_gui && menu) || core_menu || ctx.memory(|m| m.top_modal_layer()).is_some();
         let (behavior, icon) = if menu { (0, true) } else { (behavior, icon) };
         // A shown GuiButton.Modal lets go of the cursor too, unless the
         // right button is down (gui_modal.rs; asked only while the game
@@ -2420,7 +2421,9 @@ impl Game {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf());
             let (topbar_chat, topbar_inset) = self.play_topbar();
-            let Game { doc, cam, assets, play, gui, game_grab, fixed_dt, .. } = self;
+            let Game { doc, cam, assets, play, gui, game_grab, fixed_dt, show_core_gui, .. } = self;
+            let show_core_gui = *show_core_gui;
+            gui.hide_core_gui = !show_core_gui;
             // (RUSTUDIO_NO_GUI hides every GUI, to tell GUI from 3D in tests.)
             if std::env::var_os("RUSTUDIO_NO_GUI").is_none() && show_gui {
                 let _g = rustudio_core::bench::scope("gui_draw");
@@ -2449,8 +2452,9 @@ impl Game {
                 // arrow when the game set none); the system cursor is hidden
                 // then (update_game_mouse). Other grabs (a right-drag look)
                 // show nothing.
-                let menu = play.as_ref().is_some_and(|s| s.game.menu_open)
-                    || rustudio_engine::gui::share().core_menu_open;
+                let menu = show_core_gui
+                    && (play.as_ref().is_some_and(|s| s.game.menu_open)
+                        || rustudio_engine::gui::share().core_menu_open);
                 let locked_center = gui.pointer_override.is_some();
                 let (image, at) = if locked_center {
                     (
@@ -2604,8 +2608,16 @@ pub struct LightingState {
     sky_key: String,
     sky_failed: bool,
     /// The sky being prepared on a worker (for that face key).
-    #[allow(clippy::type_complexity)]
-    sky_job: Option<(String, std::sync::mpsc::Receiver<Option<(u32, Vec<u8>, [Vec3; 6])>>)>,
+    sky_job: Option<(String, std::sync::mpsc::Receiver<Option<PreparedSky>>)>,
+    /// The current key's faces before SkyboxOrientation turns them, and the
+    /// orientation of the sky on the GPU: a script turning the Sky a little
+    /// every frame (a day-cycle script) re-turns these on a worker, one job
+    /// at a time and at most every SKY_TURN_EVERY_S, instead of reading,
+    /// decoding and prefiltering the whole sky again per frame (that started
+    /// a ~0.3 s worker thread per frame and starved the whole process).
+    sky_base: Option<std::sync::Arc<SkyFaces>>,
+    sky_orient: Vec3,
+    sky_turned_at: Option<std::time::Instant>,
     /// Studio's studs.dds was looked for (loaded when found).
     studs_tried: bool,
     /// Light grid (lightgrid.rs): where it is (chunks, Studio's camera
@@ -2738,6 +2750,11 @@ impl Game {
                     let key = key.clone();
                     self.lighting.sky_job = None;
                     if key == self.lighting.sky_key {
+                        let done = done.map(|(base, orient, sky)| {
+                            self.lighting.sky_base = Some(base);
+                            self.lighting.sky_orient = orient;
+                            sky
+                        });
                         self.apply_sky(done);
                     }
                 }
@@ -2749,8 +2766,21 @@ impl Game {
         let orient = rustudio_render::lighting::sky_orientation(&self.doc);
         // Whether scripts run is part of the key: a local sky loaded in Edit
         // isn't place content in Play (assets::place_content_allowed).
-        let key = format!("{}|{:?}|{}", faces.join("|"), orient.to_array(), rustudio_core::assets::scripts_running());
+        let key = format!("{}|{}", faces.join("|"), rustudio_core::assets::scripts_running());
         if key == self.lighting.sky_key && !self.lighting.sky_failed {
+            // The same faces turned: turn the prepared ones again.
+            let st = &mut self.lighting;
+            if let Some(base) = st.sky_base.clone().filter(|_| {
+                sky_turn_due(st.sky_orient, orient, st.sky_job.is_some(), st.sky_turned_at.map(rustudio_core::sim_clock::since))
+            }) {
+                st.sky_turned_at = Some(rustudio_core::sim_clock::now());
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let sky = turn_sky(&base, orient);
+                    let _ = tx.send(Some((base, orient, sky)));
+                });
+                st.sky_job = Some((key, rx));
+            }
             return;
         }
         let doc_dir = self
@@ -2774,6 +2804,8 @@ impl Game {
         }
         self.lighting.sky_key = key.clone();
         self.lighting.sky_failed = false;
+        self.lighting.sky_base = None;
+        self.lighting.sky_turned_at = Some(rustudio_core::sim_clock::now());
         if bytes.len() != 6 {
             self.lighting.sky_job = None;
             self.apply_sky(None);
@@ -3429,9 +3461,54 @@ impl DrawCache {
     }
 }
 
+/// A sky ready for the GPU: face size, the mipped cube, its irradiance.
+type SkyCube = (u32, Vec<u8>, [Vec3; 6]);
+/// What a sky job sends back: the unturned faces (kept for re-turning),
+/// the orientation it was turned by, and the sky.
+type PreparedSky = (std::sync::Arc<SkyFaces>, Vec3, SkyCube);
+
+/// A skybox's faces before Sky.SkyboxOrientation turns them: square at one
+/// size, in the cube layout rustudio draws (+X, −X, +Y, −Y, +Z, −Z).
+#[derive(Debug, PartialEq)]
+struct SkyFaces {
+    size: u32,
+    cube: [Vec<u8>; 6],
+}
+
+/// The shortest time between two re-turns of an unchanged sky whose
+/// SkyboxOrientation keeps changing (seconds of the sim clock). A turn
+/// redoes the cube's mips, GGX prefilter and irradiance (~0.1–0.3 s of one
+/// worker) and uploads ~30 MB at 1024 px faces; a day-cycle script turning
+/// the Sky by 0.3°/s moves it 0.15° (under two texels) between turns.
+const SKY_TURN_EVERY_S: f32 = 0.5;
+
+/// Whether to start turning the prepared faces to `want`: the orientation
+/// differs from the one drawn, no sky job is running (one at a time, the
+/// newest orientation when it starts), and the last turn started at least
+/// SKY_TURN_EVERY_S ago.
+fn sky_turn_due(shown: Vec3, want: Vec3, job_running: bool, since_last: Option<std::time::Duration>) -> bool {
+    want != shown
+        && !job_running
+        && since_last.is_none_or(|t| t.as_secs_f32() >= SKY_TURN_EVERY_S)
+}
+
+/// The prepared faces turned by `orient`, mipped, with their irradiance.
+fn turn_sky(base: &SkyFaces, orient: Vec3) -> SkyCube {
+    let cube = orient_sky(base.cube.clone(), base.size, orient);
+    let irr = rustudio_render::lighting::sky_irradiance(&cube, base.size);
+    (base.size, rustudio_render::render::cube_mips(base.size, &cube), irr)
+}
+
 /// Decodes the six skybox faces (Bk, Dn, Ft, Lf, Rt, Up) into the cube
 /// rustudio draws, with its irradiance; None if any face doesn't decode.
-fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<(u32, Vec<u8>, [Vec3; 6])> {
+fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<PreparedSky> {
+    let base = std::sync::Arc::new(sky_faces_of(bytes)?);
+    let sky = turn_sky(&base, orient);
+    Some((base, orient, sky))
+}
+
+/// The six faces decoded, squared and laid out as a cube (unturned).
+fn sky_faces_of(bytes: &[std::sync::Arc<Vec<u8>>]) -> Option<SkyFaces> {
     let mut imgs = Vec::new();
     for b in bytes {
         imgs.push(rustudio_core::texture::decode(b).ok()?);
@@ -3505,9 +3582,7 @@ fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<(u32, 
             flip(fit(&imgs[0])),
             flip(fit(&imgs[2])),
         ];
-        let cube = orient_sky(cube, size, orient);
-        let irr = rustudio_render::lighting::sky_irradiance(&cube, size);
-    Some((size, rustudio_render::render::cube_mips(size, &cube), irr))
+    Some(SkyFaces { size, cube })
 }
 
 /// Turns a sky cube (+X, −X, +Y, −Y, +Z, −Z faces, wgpu's layout) by
@@ -3686,4 +3761,73 @@ fn pack_surface_maps(
         }
     }
     packed
+}
+
+#[cfg(test)]
+mod sky_turn_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn png(rgb: [u8; 3]) -> std::sync::Arc<Vec<u8>> {
+        let img = image::RgbaImage::from_fn(16, 16, |x, y| {
+            image::Rgba([rgb[0].wrapping_add(x as u8 * 8), rgb[1].wrapping_add(y as u8 * 8), rgb[2], 255])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        std::sync::Arc::new(out.into_inner())
+    }
+
+    fn faces() -> Vec<std::sync::Arc<Vec<u8>>> {
+        [[200, 0, 0], [0, 200, 0], [0, 0, 200], [200, 200, 0], [0, 200, 200], [200, 0, 200]]
+            .into_iter()
+            .map(png)
+            .collect()
+    }
+
+    /// A sky re-turned from the kept faces is the sky prepared from the
+    /// files at that orientation (the kept faces stay unturned).
+    #[test]
+    fn re_turning_the_kept_faces_matches_a_fresh_sky() {
+        let bytes = faces();
+        let (base, at, first) = prepare_sky(&bytes, Vec3::new(0.0, 10.0, 0.0)).unwrap();
+        assert_eq!(at, Vec3::new(0.0, 10.0, 0.0));
+        let to = Vec3::new(0.0, 37.5, 5.0);
+        let (_, _, fresh) = prepare_sky(&bytes, to).unwrap();
+        let again = turn_sky(&base, to);
+        assert_eq!(again.0, fresh.0);
+        assert!(again.1 == fresh.1, "re-turned cube differs from a fresh one");
+        assert_eq!(again.2, fresh.2);
+        assert!(first.1 != again.1, "the orientation changed nothing");
+        assert_eq!(*base, sky_faces_of(&bytes).unwrap());
+    }
+
+    /// One turn at a time, none while the orientation is the drawn one, and
+    /// a sky turning every frame re-turns at most every SKY_TURN_EVERY_S.
+    #[test]
+    fn a_turning_sky_is_re_turned_at_a_bounded_rate() {
+        let a = Vec3::ZERO;
+        let b = Vec3::new(0.0, 0.005, 0.0);
+        let long = Some(Duration::from_secs_f32(SKY_TURN_EVERY_S));
+        assert!(!sky_turn_due(a, a, false, long));
+        assert!(sky_turn_due(a, b, false, long));
+        assert!(sky_turn_due(a, b, false, None));
+        assert!(!sky_turn_due(a, b, true, long));
+        assert!(!sky_turn_due(a, b, false, Some(Duration::from_millis(16))));
+        // 60 frames a second for 10 s, a turn taking 0.2 s.
+        let (mut shown, mut job_end, mut last, mut turns) = (Vec3::ZERO, None::<f32>, None::<f32>, 0);
+        for frame in 0..600 {
+            let t = frame as f32 / 60.0;
+            if job_end.is_some_and(|e| t >= e) {
+                job_end = None;
+            }
+            let want = Vec3::new(0.0, 0.3 * t, 0.0);
+            if sky_turn_due(shown, want, job_end.is_some(), last.map(|l| Duration::from_secs_f32(t - l))) {
+                shown = want;
+                last = Some(t);
+                job_end = Some(t + 0.2);
+                turns += 1;
+            }
+        }
+        assert!((18..=21).contains(&turns), "{turns} turns in 10 s");
+    }
 }

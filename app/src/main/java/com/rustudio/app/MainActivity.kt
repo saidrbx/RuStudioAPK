@@ -2,6 +2,7 @@ package com.rustudio.app
 
 import android.app.NativeActivity
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -9,6 +10,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
@@ -21,10 +24,15 @@ class DiagnosticLogProvider : FileProvider()
 /**
  * Hosts librustudio.so (android.app.lib_name in the manifest): the Rust side
  * (src/android.rs) is started by the NativeActivity glue. This class only
- * handles what needs Java: the storage permission and immersive mode.
+ * handles Android UI integration, including storage and the input method.
  */
 class MainActivity : NativeActivity() {
     private var asked = false
+    private val editorKeyboard by lazy {
+        EditorKeyboardView(this, ::editorKeyboardEvent).also {
+            window.addContentView(it, ViewGroup.LayoutParams(1, 1))
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,6 +50,37 @@ class MainActivity : NativeActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) immersive()
     }
+
+    fun setEditorKeyboard(mode: Int, generation: Int) = runOnUiThread {
+        if (isFinishing || isDestroyed) return@runOnUiThread
+        val keyboard = editorKeyboard
+        val ime = getSystemService(InputMethodManager::class.java)
+        val changed = keyboard.updateTarget(mode, generation)
+        if (mode == 0) {
+            ime.hideSoftInputFromWindow(keyboard.windowToken, 0)
+            keyboard.clearFocus()
+            keyboard.isFocusable = false
+        } else {
+            val wasFocused = keyboard.hasFocus()
+            keyboard.isFocusableInTouchMode = true
+            keyboard.requestFocus()
+            if (changed && wasFocused) ime.restartInput(keyboard)
+            keyboard.post {
+                if (keyboard.matches(mode, generation) && keyboard.hasFocus()) {
+                    ime.showSoftInput(keyboard, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+        }
+    }
+
+    fun copyEditorText(text: String) = runOnUiThread {
+        getSystemService(ClipboardManager::class.java)
+            .setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), text))
+    }
+
+    private external fun editorKeyboardEvent(
+        generation: Int, kind: Int, text: String, before: Int, after: Int,
+    )
 
     /** Called by the native Help menu. Grants access to the selected recipient only. */
     fun shareDiagnosticLogs() = runOnUiThread {
@@ -81,6 +120,11 @@ class MainActivity : NativeActivity() {
     }
 
     private companion object {
+        init {
+            // Register librustudio with ART for the editorKeyboardEvent JNI call.
+            System.loadLibrary("rustudio")
+        }
+
         val LOG_NAME = Regex("rustudio-[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9]+\\.log")
     }
 

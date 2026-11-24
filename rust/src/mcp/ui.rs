@@ -89,6 +89,17 @@ impl Editor {
         let (col, text) = self.mcp_status_text();
         let clients = self.mcp.clients().len();
         let label = if clients > 0 { format!("MCP {clients}") } else { "MCP".into() };
+        if crate::mobile::enabled() {
+            let resp = ui.add(egui::Button::selectable(
+                self.mcp.panel_open,
+                RichText::new(label),
+            ));
+            self.ui_rects.insert("mcp.button", resp.rect);
+            if resp.on_hover_text(text).clicked() {
+                self.mcp.panel_open = !self.mcp.panel_open;
+            }
+            return;
+        }
         let font = egui::FontId::proportional(13.0);
         let galley = ui.painter().layout_no_wrap(label, font, theme::TEXT);
         let size = Vec2::new(galley.size().x + 26.0, 24.0);
@@ -115,7 +126,7 @@ impl Editor {
         // Drops down from the button, its right edge on the button's.
         let at = self.ui_rects.get("mcp.button").map(|r| egui::pos2(r.max.x + 120.0, r.max.y + 6.0)).unwrap_or(egui::pos2(ctx.content_rect().right() - 12.0, 60.0));
         let at = egui::pos2(at.x.min(ctx.content_rect().right() - 8.0), at.y);
-        egui::Window::new("MCP Server")
+        let mut window = egui::Window::new("MCP Server")
             .id(egui::Id::new("mcp_panel"))
             .open(&mut open)
             .pivot(egui::Align2::RIGHT_TOP)
@@ -123,8 +134,17 @@ impl Editor {
             .default_width(560.0)
             .default_height(760.0)
             .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| self.mcp_panel(ui));
+            .collapsible(false);
+        if crate::mobile::enabled() {
+            let viewport = ctx.content_rect();
+            let size = (viewport.size() - Vec2::new(24.0, 54.0)).max(Vec2::splat(1.0));
+            window = window
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 36.0))
+                .default_size(size.min(egui::vec2(560.0, 760.0)))
+                .max_size(size)
+                .resizable(false);
+        }
+        window.show(ctx, |ui| self.mcp_panel(ui));
         self.mcp.panel_open = open;
         if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::new("mcp_panel"))) {
             self.ui_rects.insert("mcp.panel", r);
@@ -258,7 +278,6 @@ impl Editor {
         let port = self.mcp.port().unwrap_or(self.mcp.settings.port);
         let url = format!("http://127.0.0.1:{port}/mcp");
         let token = self.mcp.settings.require_token.then_some(self.mcp.settings.token.as_str());
-        let sn = snippets(&url, token);
         let copy_row = |ui: &mut egui::Ui, title: &str, hint: &str, text: &str| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).strong());
@@ -269,30 +288,42 @@ impl Editor {
             if !hint.is_empty() {
                 ui.label(RichText::new(hint).small().color(theme::TEXT_DIM));
             }
-            let mut t = text.to_string();
+            let mut t = text;
             ui.add(egui::TextEdit::multiline(&mut t).font(egui::TextStyle::Monospace).desired_rows(1).desired_width(f32::INFINITY));
         };
-        copy_row(ui, "claude CLI, any open window (recommended)", "A stdio bridge: finds the rustudio windows with MCP on and talks to the newest (rustudio_use_window picks another).", &sn.claude_stdio);
-        ui.horizontal(|ui| {
-            if ui.button("Add to the claude CLI").on_hover_text(&sn.claude_stdio).clicked() {
-                let r = std::process::Command::new("claude").args(["mcp", "add", "--scope", "user", "rustudio", "--", &exe(), "mcp"]).output();
-                let msg = match r {
-                    Ok(o) if o.status.success() => format!("Added: {}", String::from_utf8_lossy(&o.stdout).trim()),
-                    Ok(o) => format!("claude said: {}{}", String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),
-                    Err(e) => format!("Couldn't run claude ({e}); copy the command instead"),
-                };
-                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("mcp_add_result"), msg));
+        #[cfg(target_os = "android")]
+        {
+            copy_row(ui, "Server URL", "Use an HTTP MCP client on this Android device.", &url);
+            if let Some(token) = token {
+                ui.add_space(4.0);
+                copy_row(ui, "Authorization header", "", &format!("Bearer {token}"));
             }
-            if let Some(m) = ui.ctx().data(|d| d.get_temp::<String>(egui::Id::new("mcp_add_result"))) {
-                ui.label(RichText::new(m).small());
-            }
-        });
-        ui.add_space(4.0);
-        copy_row(ui, "claude CLI, this window over HTTP", "Talks to this window's port directly (each window has its own).", &sn.claude_http);
-        ui.add_space(4.0);
-        copy_row(ui, "Other clients (stdio JSON)", "Desktop apps, Cursor, …: in their MCP servers config.", &sn.json_stdio);
-        ui.add_space(4.0);
-        copy_row(ui, "Other clients (HTTP JSON)", "", &sn.json_http);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let sn = snippets(&url, token);
+            copy_row(ui, "claude CLI, any open window (recommended)", "A stdio bridge: finds the rustudio windows with MCP on and talks to the newest (rustudio_use_window picks another).", &sn.claude_stdio);
+            ui.horizontal(|ui| {
+                if ui.button("Add to the claude CLI").on_hover_text(&sn.claude_stdio).clicked() {
+                    let r = std::process::Command::new("claude").args(["mcp", "add", "--scope", "user", "rustudio", "--", &exe(), "mcp"]).output();
+                    let msg = match r {
+                        Ok(o) if o.status.success() => format!("Added: {}", String::from_utf8_lossy(&o.stdout).trim()),
+                        Ok(o) => format!("claude said: {}{}", String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()),
+                        Err(e) => format!("Couldn't run claude ({e}); copy the command instead"),
+                    };
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("mcp_add_result"), msg));
+                }
+                if let Some(m) = ui.ctx().data(|d| d.get_temp::<String>(egui::Id::new("mcp_add_result"))) {
+                    ui.label(RichText::new(m).small());
+                }
+            });
+            ui.add_space(4.0);
+            copy_row(ui, "claude CLI, this window over HTTP", "Talks to this window's port directly (each window has its own).", &sn.claude_http);
+            ui.add_space(4.0);
+            copy_row(ui, "Other clients (stdio JSON)", "Desktop apps, Cursor, …: in their MCP servers config.", &sn.json_stdio);
+            ui.add_space(4.0);
+            copy_row(ui, "Other clients (HTTP JSON)", "", &sn.json_http);
+        }
     }
 
     fn mcp_activity_ui(&mut self, ui: &mut egui::Ui) {

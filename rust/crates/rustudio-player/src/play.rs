@@ -3875,6 +3875,21 @@ impl Game {
                     (seat, cseat, tf, sf)
                 });
             let mut vehicle_changed: Option<(Ref, i32, f32, i32, f32)> = None;
+            // The client's own joints follow this frame's replicated parts
+            // before its scripts run: parts only the client has (a place's
+            // LocalScript-built limbs on a server Torso) were still where the
+            // last frame's solve (p6d, after RenderStepped) left them, so
+            // Heartbeat and RenderStepped read limbs a frame behind a moving
+            // torso (0.27 studs at a walk, 60 fps). In Studio the owner's
+            // step poses its whole assembly before PostSimulation.
+            {
+                let _cj = rustudio_core::bench::scope("p6a_client_joints");
+                if let Some(s) = self.play.as_mut() {
+                    if let Some(cd) = s.other_doc.as_mut() {
+                        s.client_joints.solve(cd, &s.map.c2s);
+                    }
+                }
+            }
             let lua_sc = rustudio_core::bench::scope("p6b_lua");
             let server_doc_id = self.doc.id;
             self.with_side(Side::Client, |rt, _, _| {

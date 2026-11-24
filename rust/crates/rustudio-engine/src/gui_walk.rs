@@ -2239,7 +2239,7 @@ impl Walk<'_, '_> {
         if chat_style {
             content = content.shrink(17.0 * me.scale);
         }
-        if (boolp(d, r, "ClipsDescendants", false) || scrolling) && me.aff.is_id() {
+        if (boolp(d, r, "ClipsDescendants", false) || scrolling || class == "CanvasGroup") && me.aff.is_id() {
             me.clip = me.clip.intersect(rect);
         }
         if scrolling {
@@ -2370,28 +2370,29 @@ impl Walk<'_, '_> {
             let has = d.dom.get_by_ref(r).is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(prop)));
             if has { text_prop(d, r, prop) } else { dflt.to_string() }
         };
+        let cap = th.min(len * 0.5);
         let parts = if vertical {
             [
-                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, cap))),
                 (
                     image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
-                    Rect::from_min_max(Pos2::new(bar.left(), bar.top() + th), Pos2::new(bar.right(), bar.bottom() - th)),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.top() + cap), Pos2::new(bar.right(), bar.bottom() - cap)),
                 ),
                 (
                     image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
-                    Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - th), bar.max),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - cap), bar.max),
                 ),
             ]
         } else {
             [
-                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(cap, th))),
                 (
                     image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
-                    Rect::from_min_max(Pos2::new(bar.left() + th, bar.top()), Pos2::new(bar.right() - th, bar.bottom())),
+                    Rect::from_min_max(Pos2::new(bar.left() + cap, bar.top()), Pos2::new(bar.right() - cap, bar.bottom())),
                 ),
                 (
                     image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
-                    Rect::from_min_max(Pos2::new(bar.right() - th, bar.top()), bar.max),
+                    Rect::from_min_max(Pos2::new(bar.right() - cap, bar.top()), bar.max),
                 ),
             ]
         };
@@ -2407,8 +2408,24 @@ impl Walk<'_, '_> {
                 continue;
             };
             drew = true;
-            let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-            self.push(Shape::Mesh(quad_mesh(dst, full, tex, &|_| c, 1).into()), me);
+            // Studio's scroll-top/bottom.png are vertical half-capsules; horizontal
+            // scrollbars rotate them 90 deg CCW so texture top (v=0) is left and
+            // texture bottom (v=1) is right.
+            let mesh = if vertical {
+                let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                quad_mesh(dst, full, tex, &|_| c, 1)
+            } else {
+                let mut m = Mesh::with_texture(tex);
+                m.vertices.extend_from_slice(&[
+                    Vertex { pos: dst.left_top(), uv: Pos2::new(1.0, 0.0), color: c },
+                    Vertex { pos: dst.right_top(), uv: Pos2::new(1.0, 1.0), color: c },
+                    Vertex { pos: dst.right_bottom(), uv: Pos2::new(0.0, 1.0), color: c },
+                    Vertex { pos: dst.left_bottom(), uv: Pos2::new(0.0, 0.0), color: c },
+                ]);
+                m.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                m
+            };
+            self.push(Shape::Mesh(mesh.into()), me);
         }
         if !drew {
             // No content folder: a plain bar.
@@ -4029,6 +4046,139 @@ mod layout_tests {
             assert!((bx(b_ref).size[0] - 60.0).abs() < 0.01);
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn hide_core_gui_hides_core_ui_while_keeping_player_gui() {
+        use rbx_dom_weak::InstanceBuilder;
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let players = doc.find_child(root, "Players").unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new("Players")));
+        let lp = doc.dom.insert(players, InstanceBuilder::new("Player").with_name("Local"));
+        doc.dom.get_by_ref_mut(players).unwrap().properties.insert("LocalPlayer".into(), Variant::Ref(lp));
+        let pg = doc.dom.insert(lp, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let game_sg = doc.dom.insert(pg, InstanceBuilder::new("ScreenGui").with_name("GameHud"));
+        let game_frame = doc.dom.insert(
+            game_sg,
+            InstanceBuilder::new("Frame")
+                .with_name("HudFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 120), UDim::new(0.0, 40))),
+        );
+        let core = doc.find_child(root, "CoreGui").unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new("CoreGui")));
+        let topbar_sg = doc.dom.insert(core, InstanceBuilder::new("ScreenGui").with_name("TopBarApp"));
+        let topbar_frame = doc.dom.insert(
+            topbar_sg,
+            InstanceBuilder::new("Frame")
+                .with_name("TopBarFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 96), UDim::new(0.0, 44))),
+        );
+
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // Default: both PlayerGui and CoreGui are drawn.
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame), "PlayerGui frame should be laid out");
+        assert!(gui.layout.contains_key(&topbar_frame), "CoreGui frame should be laid out when shown");
+
+        // Hidden: CoreGui is omitted and pruned from layout while PlayerGui remains.
+        gui.hide_core_gui = true;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame), "PlayerGui frame should remain visible");
+        assert!(!gui.layout.contains_key(&topbar_frame), "CoreGui frame should be hidden");
+
+        // Toggled back on: CoreGui returns immediately.
+        gui.hide_core_gui = false;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter_at(rect);
+            gui.draw(ui.ctx(), &painter, DrawIn {
+                render_state: None,
+                doc: &doc,
+                cam: &cam,
+                rect,
+                store: &mut store,
+                doc_dir: None,
+                playing: true,
+                fixed_step: true,
+                roots: Roots::View,
+            });
+        });
+        out.textures_delta.clear();
+        assert!(gui.layout.contains_key(&game_frame));
+        assert!(gui.layout.contains_key(&topbar_frame), "CoreGui frame should return when re-enabled");
+    }
+
+    #[test]
+    fn canvas_group_clips_descendants_even_when_clips_descendants_is_false() {
+        use rbx_dom_weak::InstanceBuilder;
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_parent = doc.find_child(root, "StarterGui").unwrap();
+        let screen = doc.dom.insert(sg_parent, InstanceBuilder::new("ScreenGui"));
+        let cg = doc.dom.insert(
+            screen,
+            InstanceBuilder::new("CanvasGroup")
+                .with_property("Position", UDim2::new(UDim::new(0.0, 20), UDim::new(0.0, 30)))
+                .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 80)))
+                .with_property("ClipsDescendants", false),
+        );
+        let overflow = doc.dom.insert(
+            cg,
+            InstanceBuilder::new("Frame")
+                .with_property("Position", UDim2::new(UDim::new(0.0, 80), UDim::new(0.0, 50)))
+                .with_property("Size", UDim2::new(UDim::new(0.0, 90), UDim::new(0.0, 70))),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut child_clip = None;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(screen, rect, Down { clip: rect, aff: Aff::ID, scale: 1.0, z: 0, alpha: 1.0, tint: [1.0; 3], turn: 0.0 });
+            child_clip = walk.hits.iter().find(|h| h.r == overflow).and_then(|h| h.clip);
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            child_clip,
+            Some(Rect::from_min_size(Pos2::new(20.0, 30.0), egui::vec2(100.0, 80.0))),
+            "CanvasGroup must clip descendants to its bounds even with ClipsDescendants=false",
+        );
     }
 
 }

@@ -113,15 +113,17 @@ pub struct Layout {
     pub show_grid: Option<bool>,
     pub grid_size: Option<f32>,
     pub show_gui: Option<bool>,
+    pub show_core_gui: Option<bool>,
     pub snap_move: Option<bool>,
     pub move_inc: Option<f32>,
     pub snap_rotate: Option<bool>,
     pub rotate_inc: Option<f32>,
     pub local_space: Option<bool>,
-    /// Output's ⋯ menu: Show Timestamp / Context / Source.
+    /// Output's ⋯ menu: Show Timestamp / Context / Source / Wrap Text.
     pub show_context: Option<bool>,
     pub show_timestamp: Option<bool>,
     pub show_source: Option<bool>,
+    pub wrap_text: Option<bool>,
     /// The dragger settings menu (Geometric ▾) and Align Dragged Objects.
     #[serde(default)]
     pub dragger: Option<DraggerSettings>,
@@ -249,6 +251,7 @@ impl Layout {
         if let Some(v) = self.show_grid { ed.show_grid = v; }
         if let Some(v) = self.grid_size.and_then(finite).filter(|v| *v > 0.0) { ed.ui.grid_size = v; }
         if let Some(v) = self.show_gui { ed.ui.show_gui = v; }
+        if let Some(v) = self.show_core_gui { ed.ui.show_core_gui = v; }
         if let Some(v) = self.snap_move { ed.game.snap_move = v; }
         if let Some(v) = self.move_inc.and_then(finite).filter(|v| *v > 0.0) { ed.game.move_inc = v; }
         if let Some(v) = self.snap_rotate { ed.game.snap_rotate = v; }
@@ -257,6 +260,7 @@ impl Layout {
         if let Some(v) = self.show_timestamp { ed.output_view.show_timestamp = v; }
         if let Some(v) = self.show_context { ed.output_view.show_context = v; }
         if let Some(v) = self.show_source { ed.output_view.show_source = v; }
+        if let Some(v) = self.wrap_text { ed.output_view.wrap_text = v; }
         if let Some(d) = self.dragger {
             ed.physical_drag = d.physical;
             ed.collisions = d.collisions;
@@ -414,6 +418,7 @@ impl Saver {
             show_grid: Some(ed.show_grid),
             grid_size: Some(ed.ui.grid_size),
             show_gui: Some(ed.ui.show_gui),
+            show_core_gui: Some(ed.ui.show_core_gui_saved.unwrap_or(ed.ui.show_core_gui)),
             snap_move: Some(ed.game.snap_move),
             move_inc: Some(ed.game.move_inc),
             snap_rotate: Some(ed.game.snap_rotate),
@@ -422,6 +427,7 @@ impl Saver {
             show_context: Some(ed.output_view.show_context),
             show_timestamp: Some(ed.output_view.show_timestamp),
             show_source: Some(ed.output_view.show_source),
+            wrap_text: Some(ed.output_view.wrap_text),
             dragger: Some(DraggerSettings {
                 physical: ed.physical_drag,
                 collisions: ed.collisions,
@@ -538,6 +544,9 @@ mod tests {
         };
         assert!(layout.panels(&main).popped.is_empty());
         let old: Layout = serde_json::from_str(r#"{"version":1,"zoom":1.25}"#).unwrap();
-        assert!(old.popped.is_empty() && old.homes.is_empty());
+        assert!(old.popped.is_empty() && old.homes.is_empty() && old.wrap_text.is_none() && old.show_core_gui.is_none());
+        let saved: Layout = serde_json::from_str(r#"{"version":1,"wrap_text":false,"show_core_gui":false}"#).unwrap();
+        assert_eq!(saved.wrap_text, Some(false));
+        assert_eq!(saved.show_core_gui, Some(false));
     }
 }

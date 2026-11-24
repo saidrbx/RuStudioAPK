@@ -12,7 +12,11 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use glam::Vec3;
-use rbx_dom_weak::types::{BrickColor, Color3, Color3uint8, CustomPhysicalProperties, Enum, PhysicalProperties, Ref, Tags, Variant, Vector2, Vector3};
+use rbx_dom_weak::types::{
+    BrickColor, Color3, Color3uint8, ColorSequence, ColorSequenceKeypoint, CustomPhysicalProperties, Enum,
+    Font as RbxFont, FontStyle, FontWeight, NumberRange, NumberSequence, NumberSequenceKeypoint, PhysicalProperties,
+    Rect as RbxRect, Ref, Tags, UDim, UDim2, Variant, Vector2, Vector2int16, Vector3, Vector3int16,
+};
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
@@ -40,6 +44,9 @@ pub struct PropertiesState {
     open_rows: HashSet<String>,
     /// The cell being typed into: (row key, text).
     editing: Option<(String, String)>,
+    /// True from the click that opens a text cell until `TextEdit` has focus
+    /// and its full-selection range has been applied.
+    select_all_pending: bool,
     /// The word a double-click selected, held until the button is released
     /// (egui would otherwise select on release and flash a caret on press).
     /// Quick presses counted toward double/triple click: frame, count, time, place.
@@ -98,10 +105,15 @@ fn number_like(like: &Variant, x: f64) -> Variant {
     }
 }
 
-/// `rgb` in the same colour type as `like` (Color3uint8 for parts).
+/// `rgb` in the same colour type as `like` (Color3uint8 for parts, constant
+/// 2-stop ColorSequence for UIGradient.Color).
 fn color_variant(like: &Variant, c: [u8; 3]) -> Variant {
+    let c3 = Color3::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0);
     match like {
-        Variant::Color3(_) => Variant::Color3(Color3::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0)),
+        Variant::Color3(_) => Variant::Color3(c3),
+        Variant::ColorSequence(_) => Variant::ColorSequence(ColorSequence {
+            keypoints: vec![ColorSequenceKeypoint::new(0.0, c3), ColorSequenceKeypoint::new(1.0, c3)],
+        }),
         _ => Variant::Color3uint8(Color3uint8::new(c[0], c[1], c[2])),
     }
 }
@@ -141,7 +153,7 @@ fn fmt_v3(v: Vec3) -> String {
 /// Parses `n` comma-separated numbers; a single number fills every
 /// component (typing "0" into a Vector3 gives 0, 0, 0).
 fn parse_nums(s: &str, n: usize) -> Option<Vec<f32>> {
-    let p: Vec<f32> = s.split(',').map(|x| x.trim().trim_matches(['[', ']'])).filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let p: Vec<f32> = s.split(',').map(|x| x.trim().trim_matches(['[', ']', '{', '}']).trim()).filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect::<Option<_>>()?;
     match p.len() {
         1 => Some(vec![p[0]; n]),
         l if l == n => Some(p),
@@ -204,7 +216,13 @@ fn cf_of(v: Option<Variant>) -> Option<Xform> {
 /// A value's text as Studio shows it (None: drawn by its own widget).
 fn value_text(doc: &doc::Document, v: &Variant) -> String {
     match v {
-        Variant::String(s) => s.lines().next().unwrap_or("").to_string(),
+        Variant::String(s) => {
+            if s.contains('\n') {
+                s.replace("\r\n", " ").replace('\n', " ")
+            } else {
+                s.clone()
+            }
+        }
         Variant::Int32(i) => i.to_string(),
         Variant::Int64(i) => i.to_string(),
         Variant::Float32(f) => fmt_num(*f as f64),
@@ -213,19 +231,52 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
         Variant::Vector2(v) => format!("{}, {}", fmt_num(v.x as f64), fmt_num(v.y as f64)),
         Variant::Vector3int16(v) => format!("{}, {}, {}", v.x, v.y, v.z),
         Variant::Vector2int16(v) => format!("{}, {}", v.x, v.y),
+        // Studio UDimComponentItem::toString ("%1, %2").
         Variant::UDim(u) => format!("{}, {}", fmt_num(u.scale as f64), u.offset),
+        // Studio UDim2PropertyItem::toString ("{%1, %2},{%3, %4}").
         Variant::UDim2(u) => format!(
-            "{{{}, {}}}, {{{}, {}}}",
+            "{{{}, {}}},{{{}, {}}}",
             fmt_num(u.x.scale as f64),
             u.x.offset,
             fmt_num(u.y.scale as f64),
             u.y.offset
         ),
-        Variant::NumberRange(r) => format!("{} {}", fmt_num(r.min as f64), fmt_num(r.max as f64)),
+        // Studio RectPropertyItem::toString ("%1, %2, %3, %4").
+        Variant::Rect(r) => format!(
+            "{}, {}, {}, {}",
+            fmt_num(r.min.x as f64),
+            fmt_num(r.min.y as f64),
+            fmt_num(r.max.x as f64),
+            fmt_num(r.max.y as f64)
+        ),
+        // Studio NumberRangePropertyItem (" %f , %f ").
+        Variant::NumberRange(r) => format!("{}, {}", fmt_num(r.min as f64), fmt_num(r.max as f64)),
+        // Studio NumberSequencePropertyItem::toString:
+        // constant 2-point zero-envelope sequence shows the single number; else "<NumberSequence>".
+        Variant::NumberSequence(s) => {
+            if s.keypoints.len() == 2
+                && (s.keypoints[0].value - s.keypoints[1].value).abs() < 1e-6
+                && s.keypoints[0].envelope == 0.0
+                && s.keypoints[1].envelope == 0.0
+            {
+                fmt_num(s.keypoints[0].value as f64)
+            } else {
+                "<NumberSequence>".to_string()
+            }
+        }
+        // Studio ColorSequencePropertyItem::toString:
+        // constant 2-point sequence shows "[r, g, b]"; else "<ColorSequence>".
+        Variant::ColorSequence(s) => {
+            if let Some(rgb) = color_seq_constant(s) {
+                format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2])
+            } else {
+                "<ColorSequence>".to_string()
+            }
+        }
         Variant::Ref(r) => doc.dom.get_by_ref(*r).map(|i| i.name.clone()).unwrap_or_default(),
         Variant::ContentId(c) => c.as_str().to_string(),
         Variant::Content(c) => c.as_uri().unwrap_or_default().to_string(),
-        Variant::Font(f) => f.family.rsplit('/').next().unwrap_or("").trim_end_matches(".json").to_string(),
+        Variant::Font(f) => font_display_name(&f.family),
         Variant::Faces(f) => format!("{f:?}"),
         Variant::Axes(a) => format!("{a:?}"),
         Variant::UniqueId(u) => u.to_string(),
@@ -235,9 +286,145 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
     }
 }
 
+fn color_seq_constant(s: &ColorSequence) -> Option<[u8; 3]> {
+    if s.keypoints.len() == 2 {
+        let a = s.keypoints[0].color;
+        let b = s.keypoints[1].color;
+        if (a.r - b.r).abs() < 1e-6 && (a.g - b.g).abs() < 1e-6 && (a.b - b.b).abs() < 1e-6 {
+            return Some([
+                (a.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (a.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (a.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]);
+        }
+    }
+    None
+}
+
+fn font_display_name(family: &str) -> String {
+    family.rsplit('/').next().unwrap_or(family).trim_end_matches(".json").to_string()
+}
+
+/// Built-in Studio font family names (from `<studio>/content/fonts/families/*.json`,
+/// with a static fallback list of Studio's 44 built-in families).
+fn studio_font_families() -> &'static Vec<String> {
+    static FAMILIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FAMILIES.get_or_init(|| {
+        let mut out = Vec::new();
+        if let Some(dir) = rustudio_core::default_scripts::studio_dir() {
+            if let Ok(entries) = std::fs::read_dir(dir.join("content/fonts/families")) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            out.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out = [
+                "AccanthisADFStd", "AmaticSC", "Arimo", "Balthazar", "Bangers", "BuilderExtended",
+                "BuilderMono", "BuilderSans", "ComicNeueAngular", "Creepster", "DenkOne", "Fondamento",
+                "FredokaOne", "GrenzeGotisch", "Guru", "HighwayGothic", "Inconsolata", "IndieFlower",
+                "JosefinSans", "Jura", "Kalam", "LegacyArial", "LegacyArimo", "LuckiestGuy",
+                "Merriweather", "Michroma", "Montserrat", "NotoSansCJKFallback", "Nunito", "Oswald",
+                "PatrickHand", "PermanentMarker", "PressStart2P", "Roboto", "RobotoCondensed",
+                "RobotoMono", "RomanAntique", "Sarpanch", "SourceSansPro", "SpecialElite",
+                "TitilliumWeb", "Ubuntu", "Zekton",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        }
+        out.sort_by_key(|s| s.to_lowercase());
+        out.dedup();
+        out
+    })
+}
+
+/// Sub-component mutation for multi-selection edits (matches Studio's per-component
+/// update in `UDimComponentItem`, `RectPropertyItem`, `FontPropertyItem`).
+#[derive(Clone, Debug)]
+enum SubEdit {
+    Vec3(usize, f32),
+    Vec2(usize, f32),
+    UDimScale(f32),
+    UDimOffset(i32),
+    UDim2X(UDim),
+    UDim2Y(UDim),
+    UDim2XScale(f32),
+    UDim2XOffset(i32),
+    UDim2YScale(f32),
+    UDim2YOffset(i32),
+    RectComp(usize, f32),
+    RangeMin(f32),
+    RangeMax(f32),
+    FontFamily(String),
+    FontWeight(FontWeight),
+    FontStyle(FontStyle),
+}
+
+impl SubEdit {
+    fn apply(&self, old: &Variant) -> Option<Variant> {
+        Some(match (self, old) {
+            (SubEdit::Vec3(i, x), Variant::Vector3(v)) => {
+                let mut a = [v.x, v.y, v.z];
+                a[*i] = *x;
+                Variant::Vector3(Vector3::new(a[0], a[1], a[2]))
+            }
+            (SubEdit::Vec2(i, x), Variant::Vector2(v)) => {
+                let mut a = [v.x, v.y];
+                a[*i] = *x;
+                Variant::Vector2(Vector2::new(a[0], a[1]))
+            }
+            (SubEdit::UDimScale(s), Variant::UDim(u)) => Variant::UDim(UDim::new(*s, u.offset)),
+            (SubEdit::UDimOffset(o), Variant::UDim(u)) => Variant::UDim(UDim::new(u.scale, *o)),
+            (SubEdit::UDim2X(x), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(*x, u.y)),
+            (SubEdit::UDim2Y(y), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(u.x, *y)),
+            (SubEdit::UDim2XScale(s), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(UDim::new(*s, u.x.offset), u.y)),
+            (SubEdit::UDim2XOffset(o), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(UDim::new(u.x.scale, *o), u.y)),
+            (SubEdit::UDim2YScale(s), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(u.x, UDim::new(*s, u.y.offset))),
+            (SubEdit::UDim2YOffset(o), Variant::UDim2(u)) => Variant::UDim2(UDim2::new(u.x, UDim::new(u.y.scale, *o))),
+            // Studio RectPropertyItem sorts (x0, x1) and (y0, y1) so min <= max.
+            (SubEdit::RectComp(i, x), Variant::Rect(r)) => {
+                let mut a = [r.min.x, r.min.y, r.max.x, r.max.y];
+                a[*i] = *x;
+                Variant::Rect(RbxRect::new(
+                    Vector2::new(a[0].min(a[2]), a[1].min(a[3])),
+                    Vector2::new(a[0].max(a[2]), a[1].max(a[3])),
+                ))
+            }
+            (SubEdit::RangeMin(m), Variant::NumberRange(r)) => Variant::NumberRange(NumberRange::new(*m, r.max.max(*m))),
+            (SubEdit::RangeMax(m), Variant::NumberRange(r)) => Variant::NumberRange(NumberRange::new(r.min.min(*m), *m)),
+            (SubEdit::FontFamily(fam), Variant::Font(f)) => Variant::Font(RbxFont {
+                family: fam.clone(),
+                weight: f.weight,
+                style: f.style,
+                cached_face_id: None,
+            }),
+            (SubEdit::FontWeight(w), Variant::Font(f)) => Variant::Font(RbxFont {
+                family: f.family.clone(),
+                weight: *w,
+                style: f.style,
+                cached_face_id: None,
+            }),
+            (SubEdit::FontStyle(st), Variant::Font(f)) => Variant::Font(RbxFont {
+                family: f.family.clone(),
+                weight: f.weight,
+                style: *st,
+                cached_face_id: None,
+            }),
+            _ => return None,
+        })
+    }
+}
+
 /// What the panel did this frame.
 enum Edit {
     Prop(String, Variant),
+    SubProp(String, SubEdit),
     Frame(Frame, Option<Vec3>, Option<Vec3>),
     AddTag(String),
     RemoveTag(String),
@@ -289,12 +476,37 @@ impl Editor {
             self.props.active_row = None;
         }
         let can_collide = !matches!(self.game.doc.prop(first, "CanCollide"), Some(Variant::Bool(false)));
-        let cats = self
+        let mut cats = self
             .props
             .cache
             .entry((class.clone(), can_collide))
             .or_insert_with(|| crate::props_layout::rows(&class, can_collide))
             .clone();
+        // Multi-selection: keep only properties common to every selected class.
+        if sel.len() > 1 {
+            // Each distinct class once: a 1 000-part selection is a handful of classes.
+            let mut classes: Vec<String> = sel.iter().filter_map(|r| self.game.doc.class_of(*r).map(|c| c.to_string())).collect();
+            classes.sort_unstable();
+            classes.dedup();
+            // Origin / Pivot rows stay while every selected class has them
+            // (a Part with a WedgePart or MeshPart keeps them).
+            let frame_kind = if doc::is_a(&class, "BasePart") {
+                "BasePart"
+            } else if doc::is_a(&class, "PVInstance") {
+                "PVInstance"
+            } else {
+                class.as_str()
+            };
+            for cat in &mut cats {
+                cat.rows.retain(|row| match row {
+                    Row::Prop(n, _) => {
+                        matches!(n.as_str(), "Name" | "ClassName" | "Parent" | "Archivable" | "UniqueId")
+                            || classes.iter().all(|c| has_prop(c, n))
+                    }
+                    Row::Frame(_, _) => classes.iter().all(|c| doc::is_a(c, frame_kind)),
+                });
+            }
+        }
         let filter = self.props.filter.trim().to_lowercase();
         let mut edits: Vec<Edit> = Vec::new();
         egui::ScrollArea::vertical()
@@ -334,7 +546,7 @@ impl Editor {
                     }
                     for r in rows {
                         match r {
-                            Row::Prop(name, ro) => self.prop_row(&mut p, first, &class, name, *ro, &mut edits),
+                            Row::Prop(name, ro) => self.prop_row(&mut p, &sel, first, &class, name, *ro, &mut edits),
                             Row::Frame(label, f) => self.frame_rows(&mut p, first, label, *f, &mut edits),
                         }
                     }
@@ -404,6 +616,10 @@ impl Editor {
     }
 
     fn name_text(p: &mut Painter, r: Rect, depth: f32, name: &str, color: Color32, arrow: Option<bool>) {
+        Self::name_text_styled(p, r, depth, name, color, arrow, false);
+    }
+
+    fn name_text_styled(p: &mut Painter, r: Rect, depth: f32, name: &str, color: Color32, arrow: Option<bool>, bold: bool) {
         // Clipped at the divider, as Studio's name column is.
         let div = r.min.x + (r.width() * DIVIDER).round();
         let clip = if depth < 0.0 { r } else { Rect::from_min_max(r.min, Pos2::new(div - 2.0, r.max.y)) };
@@ -413,7 +629,12 @@ impl Editor {
             let tri = Rect::from_center_size(Pos2::new(x - 15.0, r.center().y), Vec2::splat(11.0));
             rustudio_engine::ti::paint(&painter, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, color);
         }
-        painter.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, name, FontId::proportional(FONT), color);
+        let font = if bold {
+            FontId::new(FONT, egui::FontFamily::Name("bold".into()))
+        } else {
+            FontId::proportional(FONT)
+        };
+        painter.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, name, font, color);
     }
 
     fn value_label(p: &mut Painter, v: Rect, text: &str, color: Color32) {
@@ -429,120 +650,25 @@ impl Editor {
     /// second click picks the number under the pointer, a third the whole
     /// text, and dragging after a double-click extends word by word.
     fn text_cell(&mut self, p: &mut Painter, key: &str, v: Rect, shown: &str, ro: bool, clicked: bool) -> Option<String> {
-        use egui::text::{CCursor, CCursorRange};
-        let eid = egui::Id::new(("prop_edit", key));
-        let ctx = p.ui.ctx().clone();
-        let (pressed, down, pos, now, shift) =
-            p.ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift));
-        // Count quick presses once a frame (1 = caret, 2 = word, 3 = all).
-        if pressed && self.props.press_frame != self.game.frame_no {
-            self.props.press_frame = self.game.frame_no;
-            let near = pos.zip(self.props.press_pos).is_some_and(|(a, b)| a.distance(b) < 6.0);
-            self.props.press_count = if near && now - self.props.press_time < 0.4 { self.props.press_count % 3 + 1 } else { 1 };
-            self.props.press_time = now;
-            self.props.press_pos = pos;
-        }
-        let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == key);
-        if !editing {
-            Self::value_label(p, v, shown, if ro { READ_ONLY } else { TEXT });
-            if clicked && !ro {
-                self.props.editing = Some((key.to_string(), shown.to_string()));
-                let mut st = egui::text_edit::TextEditState::default();
-                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(shown.chars().count()))));
-                st.store(&ctx, eid);
-                self.props.drag = None;
-                self.props.edit_layout = None;
-                ctx.request_repaint();
-            }
-            return None;
-        }
-        let mut text = self.props.editing.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
-        let n = text.chars().count();
-        // Selection from the pointer, worked out against last frame's layout
-        // so this frame already paints it.
-        let mut sel: Option<(usize, usize)> = None;
-        if let Some((_, galley, gpos, rect)) = self.props.edit_layout.clone().filter(|l| l.0 == key) {
-            let char_at = |q: Pos2| usize::from(galley.cursor_from_pos(q - gpos).index).min(n);
-            match (pos, self.props.drag) {
-                (Some(q), _) if pressed && rect.contains(q) => {
-                    let c = char_at(q);
-                    let (a, b) = match self.props.press_count {
-                        1 if shift => {
-                            let anchor = egui::text_edit::TextEditState::load(&ctx, eid)
-                                .and_then(|s| s.cursor.char_range())
-                                .map_or(c, |r| usize::from(r.secondary.index));
-                            (anchor, c)
-                        }
-                        1 => (c, c),
-                        2 => word_bounds(&text, c),
-                        _ => (0, n),
-                    };
-                    self.props.drag = Some((self.props.press_count, a, b));
-                    sel = Some((a, b));
-                }
-                (Some(q), Some((mode, a, b))) if down && !pressed => {
-                    let c = char_at(q);
-                    sel = Some(match mode {
-                        1 => (a, c),
-                        2 => {
-                            let (wa, wb) = word_bounds(&text, c);
-                            if wa < a { (b, wa) } else { (a, wb.max(b)) }
-                        }
-                        _ => (0, n),
-                    });
-                }
-                _ => {}
-            }
-        }
-        if !down {
-            self.props.drag = None;
-        }
-        if let Some((a, b)) = sel {
-            let mut st = egui::text_edit::TextEditState::load(&ctx, eid).unwrap_or_default();
-            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
-            st.store(&ctx, eid);
-        }
-        let out = p
-            .ui
-            .scope_builder(egui::UiBuilder::new().max_rect(v).layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)), |ui| {
-                egui::TextEdit::singleline(&mut text).id(eid).frame(egui::Frame::NONE).font(FontId::proportional(FONT)).show(ui)
-            })
-            .inner;
-        let resp = out.response.response.clone();
-        // Sits over the edit box so egui's own click handling never runs.
-        p.ui.interact(resp.rect, eid.with("mouse"), egui::Sense::CLICK | egui::Sense::DRAG).on_hover_cursor(egui::CursorIcon::Text);
-        self.props.edit_layout = Some((key.to_string(), out.galley.clone(), out.galley_pos, resp.rect));
-        resp.request_focus();
-        let (enter, esc) = p.ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-        if esc {
-            self.props.editing = None;
-            return None;
-        }
-        if enter || resp.lost_focus() {
-            self.props.editing = None;
-            return Some(text);
-        }
-        self.props.editing = Some((key.to_string(), text));
-        None
+        text_cell_on(&mut self.props, self.game.frame_no, p, key, v, shown, ro, clicked)
     }
 
-    fn prop_row(&mut self, p: &mut Painter, first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
-        // ClassName / Parent aren't stored properties.
-        let parent_is_root = self.game.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
-        let value = match name {
+    fn prop_value(&self, r: Ref, class: &str, name: &str) -> Option<Variant> {
+        let parent_is_root = self.game.doc.dom.get_by_ref(r).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
+        match name {
             "ClassName" => Some(Variant::String(class.to_string())),
-            "Name" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::String(i.name.clone())),
+            "Name" => self.game.doc.dom.get_by_ref(r).map(|i| Variant::String(i.name.clone())),
             "Parent" if parent_is_root => Some(Variant::String(self.game.doc.title.clone())),
-            "Parent" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::Ref(i.parent())),
+            "Parent" => self.game.doc.dom.get_by_ref(r).map(|i| Variant::Ref(i.parent())),
             // A Part resizes on every face by whole studs (Studio: "Right, Top,
             // Back, Left, Bottom, Front", 1).
-            "ResizeableFaces" if self.game.doc.prop(first, name).is_none() => {
+            "ResizeableFaces" if self.game.doc.prop(r, name).is_none() => {
                 Some(Variant::String("Right, Top, Back, Left, Bottom, Front".into()))
             }
-            "ResizeIncrement" if self.game.doc.prop(first, name).is_none() => Some(Variant::Int32(1)),
+            "ResizeIncrement" if self.game.doc.prop(r, name).is_none() => Some(Variant::Int32(1)),
             // A part keeps only Color; its BrickColor is the nearest palette
             // colour (Studio shows both).
-            "BrickColor" => self.game.doc.prop(first, name).or_else(|| match self.game.doc.prop(first, "Color") {
+            "BrickColor" => self.game.doc.prop(r, name).or_else(|| match self.game.doc.prop(r, "Color") {
                 Some(Variant::Color3uint8(c)) => Some(Variant::BrickColor(nearest_brick([c.r, c.g, c.b]))),
                 _ => None,
             }),
@@ -550,22 +676,22 @@ impl Editor {
             // them (captured RefPart 4×1.2×2 Plastic: Mass 6.72, AssemblyMass
             // inf when anchored, root itself, centre at its position).
             "Mass" | "AssemblyMass" | "AssemblyRootPart" | "AssemblyCenterOfMass" if doc::is_a(class, "BasePart") => {
-                let size = match self.game.doc.prop(first, "Size") {
+                let size = match self.game.doc.prop(r, "Size") {
                     Some(Variant::Vector3(s)) => s,
                     _ => Vector3::new(4.0, 1.2, 2.0),
                 };
-                let density = match self.game.doc.prop(first, "CustomPhysicalProperties") {
+                let density = match self.game.doc.prop(r, "CustomPhysicalProperties") {
                     Some(Variant::PhysicalProperties(PhysicalProperties::Custom(c))) => c.density(),
                     _ => rustudio_core::mech::PART_DENSITY,
                 };
                 let mass = size.x * size.y * size.z * density;
-                let anchored = matches!(self.game.doc.prop(first, "Anchored"), Some(Variant::Bool(true)));
+                let anchored = matches!(self.game.doc.prop(r, "Anchored"), Some(Variant::Bool(true)));
                 Some(match name {
                     "Mass" => Variant::Float32(mass),
                     "AssemblyMass" if anchored => Variant::String("inf".into()),
                     "AssemblyMass" => Variant::Float32(mass),
-                    "AssemblyRootPart" => Variant::Ref(first),
-                    _ => Variant::Vector3(rustudio_core::math::rv3(rustudio_render::scene::xform_of(&self.game.doc, first).map(|x| x.pos).unwrap_or_default())),
+                    "AssemblyRootPart" => Variant::Ref(r),
+                    _ => Variant::Vector3(rustudio_core::math::rv3(rustudio_render::scene::xform_of(&self.game.doc, r).map(|x| x.pos).unwrap_or_default())),
                 })
             }
             // Studio shows PhysicalProperties as a checkbox: Current is always
@@ -573,31 +699,88 @@ impl Editor {
             "CurrentPhysicalProperties" => Some(Variant::Bool(true)),
             // A script runs unless Disabled or Enabled = false (as Play reads it).
             "Enabled" if doc::is_a(class, "BaseScript") => Some(Variant::Bool(
-                !matches!(self.game.doc.prop(first, "Disabled"), Some(Variant::Bool(true)))
-                    && !matches!(self.game.doc.prop(first, "Enabled"), Some(Variant::Bool(false))),
+                !matches!(self.game.doc.prop(r, "Disabled"), Some(Variant::Bool(true)))
+                    && !matches!(self.game.doc.prop(r, "Enabled"), Some(Variant::Bool(false))),
             )),
-            // A ScreenGui's AbsoluteSize is the view's size (Studio: 863, 675
-            // for its 863×675 viewport).
-            "AbsoluteSize" if doc::is_a(class, "LayerCollector") => {
-                let s = self.game.viewport_rect.size();
-                Some(Variant::Vector2(Vector2::new(s.x.round(), s.y.round())))
+            // GUI computed layout properties from the live GUI pass (GuiBox).
+            "AbsolutePosition" if doc::is_a(class, "GuiBase2d") => {
+                let pos = self.game.gui.layout.get(&r).map(|b| b.pos).unwrap_or([0.0, 0.0]);
+                Some(Variant::Vector2(Vector2::new(pos[0], pos[1])))
+            }
+            "AbsoluteSize" if doc::is_a(class, "GuiBase2d") => {
+                if let Some(b) = self.game.gui.layout.get(&r) {
+                    Some(Variant::Vector2(Vector2::new(b.size[0], b.size[1])))
+                } else if doc::is_a(class, "LayerCollector") {
+                    let s = self.game.viewport_rect.size();
+                    Some(Variant::Vector2(Vector2::new(s.x.round(), s.y.round())))
+                } else {
+                    Some(Variant::Vector2(Vector2::new(0.0, 0.0)))
+                }
+            }
+            "AbsoluteRotation" if doc::is_a(class, "GuiBase2d") => {
+                let rot = self.game.gui.layout.get(&r).map(|b| b.rot).unwrap_or(0.0);
+                Some(Variant::Float32(rot))
+            }
+            "TextBounds" if doc::is_a(class, "GuiObject") => {
+                let tb = self.game.gui.layout.get(&r).and_then(|b| b.text).unwrap_or([0.0, 0.0]);
+                Some(Variant::Vector2(Vector2::new(tb[0], tb[1])))
+            }
+            "TextFits" if doc::is_a(class, "GuiObject") => {
+                let fits = self.game.gui.layout.get(&r).map(|b| b.text_fits).unwrap_or(true);
+                Some(Variant::Bool(fits))
+            }
+            "AbsoluteCanvasSize" if doc::is_a(class, "ScrollingFrame") => {
+                let sz = self.game.gui.layout.get(&r).and_then(|b| b.canvas).unwrap_or([0.0, 0.0]);
+                Some(Variant::Vector2(Vector2::new(sz[0], sz[1])))
+            }
+            "AbsoluteWindowSize" if doc::is_a(class, "ScrollingFrame") => {
+                let sz = self.game.gui.layout.get(&r).and_then(|b| b.window).unwrap_or([0.0, 0.0]);
+                Some(Variant::Vector2(Vector2::new(sz[0], sz[1])))
+            }
+            "ContentText" if matches!(class, "TextLabel" | "TextButton" | "TextBox") => {
+                let text = match self.game.doc.prop(r, "Text") {
+                    Some(Variant::String(s)) => s,
+                    _ => String::new(),
+                };
+                let rich = matches!(self.game.doc.prop(r, "RichText"), Some(Variant::Bool(true)));
+                Some(Variant::String(if rich { strip_rich_tags(&text) } else { text }))
+            }
+            // Image / ImageContent twin fallback on ImageLabel / ImageButton.
+            "Image" | "ImageContent" if matches!(class, "ImageLabel" | "ImageButton") => {
+                let read = |prop: &str| match self.game.doc.prop(r, prop) {
+                    Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+                    Some(Variant::ContentId(c)) => c.as_str().to_string(),
+                    Some(Variant::String(s)) => s,
+                    _ => String::new(),
+                };
+                let primary = read(name);
+                let uri = if !primary.is_empty() {
+                    primary
+                } else {
+                    read(if name == "ImageContent" { "Image" } else { "ImageContent" })
+                };
+                if name == "ImageContent" {
+                    Some(Variant::Content(rbx_dom_weak::types::Content::from(uri)))
+                } else {
+                    Some(Variant::ContentId(uri.into()))
+                }
             }
             // Every instance has a UniqueId in Studio; one not saved yet shows
             // its session id.
             "UniqueId"
-                if match self.game.doc.prop(first, name) {
+                if match self.game.doc.prop(r, name) {
                     Some(Variant::UniqueId(u)) => u.to_string().bytes().all(|c| c == b'0'),
                     other => other.is_none(),
                 } =>
             {
-                Some(Variant::String(format!("{first}")))
+                Some(Variant::String(format!("{r}")))
             }
             "CustomPhysicalProperties" => Some(Variant::Bool(matches!(
-                self.game.doc.prop(first, name),
+                self.game.doc.prop(r, name),
                 Some(Variant::PhysicalProperties(PhysicalProperties::Custom(_)))
             ))),
             "AudioContent" if matches!(class, "Sound" | "AudioPlayer") => {
-                let read = |prop: &str| match self.game.doc.prop(first, prop) {
+                let read = |prop: &str| match self.game.doc.prop(r, prop) {
                     Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
                     Some(Variant::ContentId(c)) => c.as_str().to_string(),
                     Some(Variant::String(s)) => s,
@@ -611,16 +794,48 @@ impl Editor {
                 };
                 Some(Variant::Content(rbx_dom_weak::types::Content::from(uri)))
             }
-            _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(first, name).is_some() => {
-                self.live_sound_prop(first, name)
+            _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(r, name).is_some() => {
+                self.live_sound_prop(r, name)
             }
-            _ => self.game.doc.prop(first, name).or_else(|| typed_empty(class, name)),
+            _ => self.game.doc.prop(r, name).or_else(|| typed_empty(class, name)),
+        }
+    }
+
+    fn prop_row(&mut self, p: &mut Painter, sel: &[Ref], first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
+        let parent_is_root = self.game.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
+        let value = self.prop_value(first, class, name);
+        let all_vals: Vec<Option<Variant>> = if sel.len() > 1 {
+            sel.iter()
+                .map(|&r| {
+                    let c = self.game.doc.class_of(r).map(|s| s.to_string()).unwrap_or_default();
+                    self.prop_value(r, &c, name)
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
+        let mixed = sel.len() > 1
+            && all_vals
+                .iter()
+                .skip(1)
+                .any(|v| !opt_variant_eq(value.as_ref(), v.as_ref()));
         let ro = ro_api
             || matches!(name, "ClassName" | "UniqueId" | "IsInSandbox")
             || (name == "Parent" && parent_is_root);
         let color = if ro { READ_ONLY } else { TEXT };
-        let vec_like = matches!(value, Some(Variant::Vector3(_)) | Some(Variant::Vector2(_)));
+        let bold = value
+            .as_ref()
+            .is_some_and(|v| mixed || is_non_default(class, name, v, ro));
+        let vec_like = matches!(
+            value,
+            Some(Variant::Vector3(_))
+                | Some(Variant::Vector2(_))
+                | Some(Variant::UDim(_))
+                | Some(Variant::UDim2(_))
+                | Some(Variant::Rect(_))
+                | Some(Variant::NumberRange(_))
+                | Some(Variant::Font(_))
+        );
         let audio_content_row = name == "AudioContent" && matches!(class, "Sound" | "AudioPlayer");
         let audio_folded = self.props.open_rows.contains("fold:AudioContent");
         let open = self.props.open_rows.contains(name);
@@ -639,7 +854,7 @@ impl Editor {
                 .then_some(open)
                 .or((matches!(value, Some(Variant::Faces(_))) || matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties") || custom_set).then_some(false))
         };
-        Self::name_text(p, r, 0.0, name, color, arrow);
+        Self::name_text_styled(p, r, 0.0, name, color, arrow, bold);
         self.props.drawn.push(name.to_string());
         let on_name = resp.interact_pointer_pos().is_some_and(|q| q.x < v.min.x);
         if resp.clicked() && on_name {
@@ -661,14 +876,20 @@ impl Editor {
             Variant::Bool(b) => {
                 let br = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 7.0), Vec2::splat(14.0));
                 let painter = p.ui.painter();
-                if *b {
+                if mixed {
+                    // Studio tri-state indeterminate checkbox when multi-selected values differ.
+                    painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(130, 134, 148) });
+                    let dash = Rect::from_center_size(br.center(), Vec2::new(8.0, 2.0));
+                    painter.rect_filled(dash, 0.5, Color32::from_rgb(25, 26, 31));
+                } else if *b {
                     painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(230, 231, 233) });
                     rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
                 } else {
                     painter.rect_filled(br, 2.0, BOX_OFF);
                 }
                 if clicked_value && !ro {
-                    edits.push(Edit::Prop(name.to_string(), Variant::Bool(!b)));
+                    let next = if mixed { true } else { !*b };
+                    edits.push(Edit::Prop(name.to_string(), Variant::Bool(next)));
                 }
             }
             Variant::Color3(_) | Variant::Color3uint8(_) | Variant::BrickColor(_) => {
@@ -682,16 +903,20 @@ impl Editor {
                     _ => unreachable!(),
                 };
                 let sw = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 6.0), Vec2::splat(12.0));
-                p.ui.painter().rect_filled(sw, 1.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                p.ui.painter().rect_filled(sw, 1.0, if mixed { BOX_OFF } else { Color32::from_rgb(rgb[0], rgb[1], rgb[2]) });
                 p.ui.painter().rect_stroke(sw, 1.0, Stroke::new(1.0, BAND), egui::StrokeKind::Inside);
-                let text = match label {
-                    Some(n) => n,
-                    None => {
-                        let base = format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2]);
-                        // A part's Color names its BrickColor when it is one (captured).
-                        match brick_name(rgb).filter(|_| name == "Color") {
-                            Some(n) => format!("{base} ({n})"),
-                            None => base,
+                let text = if mixed {
+                    String::new()
+                } else {
+                    match label {
+                        Some(n) => n,
+                        None => {
+                            let base = format!("[{}, {}, {}]", rgb[0], rgb[1], rgb[2]);
+                            // A part's Color names its BrickColor when it is one (captured).
+                            match brick_name(rgb).filter(|_| name == "Color") {
+                                Some(n) => format!("{base} ({n})"),
+                                None => base,
+                            }
                         }
                     }
                 };
@@ -717,7 +942,7 @@ impl Editor {
                     if clicked_value && on_swatch {
                         self.open_color_dialog(name, rgb);
                     }
-                    let plain = format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]);
+                    let plain = if mixed { String::new() } else { format!("{}, {}, {}", rgb[0], rgb[1], rgb[2]) };
                     let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == name);
                     if !editing {
                         Self::value_label(p, tv, &text, color);
@@ -726,6 +951,69 @@ impl Editor {
                         if let Some(n) = parse_nums(&t, 3) {
                             let c = [n[0].clamp(0.0, 255.0) as u8, n[1].clamp(0.0, 255.0) as u8, n[2].clamp(0.0, 255.0) as u8];
                             edits.push(Edit::Prop(name.to_string(), color_variant(&value, c)));
+                        }
+                    }
+                }
+            }
+            Variant::ColorSequence(seq) => {
+                // Studio ColorSequencePropertyItem: swatch/gradient + "[r, g, b]" or "<ColorSequence>".
+                let sw = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 6.0), Vec2::new(24.0, 12.0));
+                if mixed || seq.keypoints.is_empty() {
+                    p.ui.painter().rect_filled(sw, 1.0, BOX_OFF);
+                } else if seq.keypoints.len() == 1 {
+                    let c = seq.keypoints[0].color;
+                    let c32 = Color32::from_rgb((c.r * 255.0).round() as u8, (c.g * 255.0).round() as u8, (c.b * 255.0).round() as u8);
+                    p.ui.painter().rect_filled(sw, 1.0, c32);
+                } else {
+                    // Paint gradient preview strip across the swatch.
+                    let mut mesh = egui::Mesh::default();
+                    for w in seq.keypoints.windows(2) {
+                        let (a, b) = (&w[0], &w[1]);
+                        let x0 = sw.min.x + a.time.clamp(0.0, 1.0) * sw.width();
+                        let x1 = sw.min.x + b.time.clamp(0.0, 1.0) * sw.width();
+                        let ca = Color32::from_rgb((a.color.r * 255.0).round() as u8, (a.color.g * 255.0).round() as u8, (a.color.b * 255.0).round() as u8);
+                        let cb = Color32::from_rgb((b.color.r * 255.0).round() as u8, (b.color.g * 255.0).round() as u8, (b.color.b * 255.0).round() as u8);
+                        let base = mesh.vertices.len() as u32;
+                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x0, sw.min.y), uv: egui::epaint::WHITE_UV, color: ca });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x1, sw.min.y), uv: egui::epaint::WHITE_UV, color: cb });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x1, sw.max.y), uv: egui::epaint::WHITE_UV, color: cb });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: Pos2::new(x0, sw.max.y), uv: egui::epaint::WHITE_UV, color: ca });
+                        mesh.add_triangle(base, base + 1, base + 2);
+                        mesh.add_triangle(base, base + 2, base + 3);
+                    }
+                    p.ui.painter().add(egui::Shape::mesh(mesh));
+                }
+                p.ui.painter().rect_stroke(sw, 1.0, Stroke::new(1.0, BAND), egui::StrokeKind::Inside);
+                let tv = Rect::from_min_max(Pos2::new(sw.max.x + 6.0, v.min.y), v.max);
+                let text = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if ro {
+                    Self::value_label(p, tv, &text, color);
+                } else {
+                    let rgb = color_seq_constant(seq).unwrap_or_else(|| {
+                        seq.keypoints.first().map(|k| [
+                            (k.color.r * 255.0).round() as u8,
+                            (k.color.g * 255.0).round() as u8,
+                            (k.color.b * 255.0).round() as u8,
+                        ]).unwrap_or([255, 255, 255])
+                    });
+                    let on_swatch = resp.interact_pointer_pos().is_some_and(|q| q.x < tv.min.x);
+                    if clicked_value && on_swatch {
+                        self.open_color_dialog(name, rgb);
+                    }
+                    let plain = if mixed {
+                        String::new()
+                    } else if let Some(c) = color_seq_constant(seq) {
+                        format!("{}, {}, {}", c[0], c[1], c[2])
+                    } else {
+                        text.clone()
+                    };
+                    let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == name);
+                    if !editing {
+                        Self::value_label(p, tv, &text, color);
+                    }
+                    if let Some(t) = self.text_cell(p, name, if editing { tv } else { Rect::NOTHING }, &plain, false, clicked_value && !on_swatch) {
+                        if let Some(nv) = parse_like(&value, &t) {
+                            edits.push(Edit::Prop(name.to_string(), nv));
                         }
                     }
                 }
@@ -745,7 +1033,11 @@ impl Editor {
                         v
                     })
                     .unwrap_or_default();
-                let cur_name = items.iter().find(|(_, n)| *n == cur).map(|(k, _)| k.clone()).unwrap_or_else(|| cur.to_string());
+                let cur_name = if mixed {
+                    String::new()
+                } else {
+                    items.iter().find(|(_, n)| *n == cur).map(|(k, _)| k.clone()).unwrap_or_else(|| cur.to_string())
+                };
                 Self::value_label(p, v, &cur_name, color);
                 if !ro {
                     let id = egui::Id::new(("enum_popup", name));
@@ -773,13 +1065,13 @@ impl Editor {
                                 .show(ui, |ui| {
                                     for (k, n) in &items {
                                         let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
-                                        let sel = *n == cur;
-                                        if sel || resp.hovered() {
-                                            let bg = if sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        let is_sel = !mixed && *n == cur;
+                                        if is_sel || resp.hovered() {
+                                            let bg = if is_sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
                                             ui.painter().rect_filled(r, 0.0, bg);
                                         }
                                         ui.painter().text(Pos2::new(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, k, FontId::proportional(FONT), TEXT);
-                                        if sel && just_opened {
+                                        if is_sel && just_opened {
                                             resp.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         if resp.clicked() {
@@ -788,14 +1080,15 @@ impl Editor {
                                     }
                                 });
                         });
-                    if let Some(n) = picked.filter(|n| *n != cur) {
+                    if let Some(n) = picked.filter(|n| mixed || *n != cur) {
                         edits.push(Edit::Prop(name.to_string(), Variant::Enum(Enum::from_u32(n))));
                     }
                 }
             }
             Variant::Vector3(v3) => {
                 let g = rustudio_core::math::v3(*v3);
-                if let Some(t) = self.text_cell(p, name, v, &fmt_v3(g), ro, clicked_value) {
+                let shown = if mixed { String::new() } else { fmt_v3(g) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value) {
                     if let Some(n) = parse_v3(&t) {
                         edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
                     }
@@ -805,12 +1098,315 @@ impl Editor {
                         let key = format!("{name}.{axis}");
                         let (r, vv, resp) = Self::cells(p, &key);
                         Self::name_text(p, r, 1.0, axis, color, None);
-                        if let Some(t) = self.text_cell(p, &key, vv, &fmt_num(g[i] as f64), ro, resp.clicked()) {
+                        let comp_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                            Some(Variant::Vector3(other)) => ([other.x, other.y, other.z][i] - g[i]).abs() > 1e-5,
+                            _ => true,
+                        });
+                        let comp_shown = if comp_mixed { String::new() } else { fmt_num(g[i] as f64) };
+                        let on_sub_val = resp.interact_pointer_pos().is_some_and(|q| q.x >= vv.min.x);
+                        if let Some(t) = self.text_cell(p, &key, vv, &comp_shown, ro, resp.clicked() && on_sub_val && !ro) {
                             if let Ok(x) = t.trim().parse::<f32>() {
-                                let mut n = g;
-                                n[i] = x;
-                                edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
+                                edits.push(Edit::SubProp(name.to_string(), SubEdit::Vec3(i, x)));
                             }
+                        }
+                    }
+                }
+            }
+            // Studio Vector2PropertyItem: "x, y", opening to X and Y.
+            Variant::Vector2(v2) => {
+                let comps = [v2.x, v2.y];
+                let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    for (i, axis) in ["X", "Y"].iter().enumerate() {
+                        let key = format!("{name}.{axis}");
+                        let (r, vv, resp) = Self::cells(p, &key);
+                        Self::name_text(p, r, 1.0, axis, color, None);
+                        let comp_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                            Some(Variant::Vector2(other)) => ([other.x, other.y][i] - comps[i]).abs() > 1e-5,
+                            _ => true,
+                        });
+                        let comp_shown = if comp_mixed { String::new() } else { fmt_num(comps[i] as f64) };
+                        let on_sub_val = resp.interact_pointer_pos().is_some_and(|q| q.x >= vv.min.x);
+                        if let Some(t) = self.text_cell(p, &key, vv, &comp_shown, ro, resp.clicked() && on_sub_val && !ro) {
+                            if let Ok(x) = t.trim().parse::<f32>() {
+                                edits.push(Edit::SubProp(name.to_string(), SubEdit::Vec2(i, x)));
+                            }
+                        }
+                    }
+                }
+            }
+            // Studio's UDim2 row: "{xs, xo},{ys, yo}", opening to X and Y,
+            // each opening to Scale and Offset.
+            Variant::UDim2(u) => {
+                let u = *u;
+                let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    for (is_y, axis, part) in [(false, "X", u.x), (true, "Y", u.y)] {
+                        let key = format!("{name}.{axis}");
+                        let axis_vals: Vec<UDim> = all_vals.iter().filter_map(|o| match o {
+                            Some(Variant::UDim2(u2)) => Some(if is_y { u2.y } else { u2.x }),
+                            _ => None,
+                        }).collect();
+                        if let Some(sub) = self.udim_rows(p, &key, axis, 1.0, part, &axis_vals, ro, color) {
+                            let se = match (is_y, sub) {
+                                (false, UDimSubEdit::Whole(n)) => SubEdit::UDim2X(n),
+                                (true, UDimSubEdit::Whole(n)) => SubEdit::UDim2Y(n),
+                                (false, UDimSubEdit::Scale(s)) => SubEdit::UDim2XScale(s),
+                                (true, UDimSubEdit::Scale(s)) => SubEdit::UDim2YScale(s),
+                                (false, UDimSubEdit::Offset(o)) => SubEdit::UDim2XOffset(o),
+                                (true, UDimSubEdit::Offset(o)) => SubEdit::UDim2YOffset(o),
+                            };
+                            edits.push(Edit::SubProp(name.to_string(), se));
+                        }
+                    }
+                }
+            }
+            Variant::UDim(u) => {
+                let u = *u;
+                let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    let u_vals: Vec<UDim> = all_vals.iter().filter_map(|o| match o {
+                        Some(Variant::UDim(u1)) => Some(*u1),
+                        _ => None,
+                    }).collect();
+                    if let Some(sub) = self.udim_parts(p, name, 1.0, u, &u_vals, ro, color) {
+                        match sub {
+                            UDimSubEdit::Scale(s) => edits.push(Edit::SubProp(name.to_string(), SubEdit::UDimScale(s))),
+                            UDimSubEdit::Offset(o) => edits.push(Edit::SubProp(name.to_string(), SubEdit::UDimOffset(o))),
+                            UDimSubEdit::Whole(n) => edits.push(Edit::Prop(name.to_string(), Variant::UDim(n))),
+                        }
+                    }
+                }
+            }
+            // Studio RectPropertyItem: "x0, y0, x1, y1", opening to X0, Y0, X1, Y1.
+            Variant::Rect(rc) => {
+                let comps = [rc.min.x, rc.min.y, rc.max.x, rc.max.y];
+                let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    for (i, label) in ["X0", "Y0", "X1", "Y1"].iter().enumerate() {
+                        let key = format!("{name}.{label}");
+                        let (r, vv, resp) = Self::cells(p, &key);
+                        Self::name_text(p, r, 1.0, label, color, None);
+                        let comp_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                            Some(Variant::Rect(other)) => ([other.min.x, other.min.y, other.max.x, other.max.y][i] - comps[i]).abs() > 1e-5,
+                            _ => true,
+                        });
+                        let comp_shown = if comp_mixed { String::new() } else { fmt_num(comps[i] as f64) };
+                        let on_sub_val = resp.interact_pointer_pos().is_some_and(|q| q.x >= vv.min.x);
+                        if let Some(t) = self.text_cell(p, &key, vv, &comp_shown, ro, resp.clicked() && on_sub_val && !ro) {
+                            if let Ok(x) = t.trim().parse::<f32>() {
+                                edits.push(Edit::SubProp(name.to_string(), SubEdit::RectComp(i, x)));
+                            }
+                        }
+                    }
+                }
+            }
+            // Studio NumberRangePropertyItem: "min, max", opening to Min and Max.
+            Variant::NumberRange(nr) => {
+                let nr = *nr;
+                let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
+                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                    if let Some(nv) = parse_like(&value, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
+                    }
+                }
+                if open {
+                    for (is_max, label, cur_v) in [(false, "Min", nr.min), (true, "Max", nr.max)] {
+                        let key = format!("{name}.{label}");
+                        let (r, vv, resp) = Self::cells(p, &key);
+                        Self::name_text(p, r, 1.0, label, color, None);
+                        let comp_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                            Some(Variant::NumberRange(other)) => ((if is_max { other.max } else { other.min }) - cur_v).abs() > 1e-5,
+                            _ => true,
+                        });
+                        let comp_shown = if comp_mixed { String::new() } else { fmt_num(cur_v as f64) };
+                        let on_sub_val = resp.interact_pointer_pos().is_some_and(|q| q.x >= vv.min.x);
+                        if let Some(t) = self.text_cell(p, &key, vv, &comp_shown, ro, resp.clicked() && on_sub_val && !ro) {
+                            if let Ok(x) = t.trim().parse::<f32>() {
+                                let se = if is_max { SubEdit::RangeMax(x) } else { SubEdit::RangeMin(x) };
+                                edits.push(Edit::SubProp(name.to_string(), se));
+                            }
+                        }
+                    }
+                }
+            }
+            // Studio FontPropertyItem: family picker, opening to Weight and Style.
+            Variant::Font(f) => {
+                let f = f.clone();
+                let fam_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                    Some(Variant::Font(other)) => other.family != f.family,
+                    _ => true,
+                });
+                let cur_fam = font_display_name(&f.family);
+                Self::value_label(p, v, if fam_mixed { "" } else { &cur_fam }, color);
+                if !ro {
+                    let id = egui::Id::new(("font_family_popup", name));
+                    if clicked_value {
+                        egui::Popup::open_id(p.ui.ctx(), id);
+                    }
+                    let families = studio_font_families();
+                    let mut picked: Option<String> = None;
+                    const ITEM_H: f32 = 19.0;
+                    let width = v.width().max(150.0);
+                    egui::Popup::new(id, p.ui.ctx().clone(), egui::PopupAnchor::Position(v.left_bottom()), p.ui.layer_id())
+                        .kind(egui::PopupKind::Menu)
+                        .open_memory(None)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                        .width(width)
+                        .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                        .show(|ui| {
+                            ui.set_width(width - 4.0);
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(ITEM_H * 12.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for fam in families {
+                                        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
+                                        let is_sel = !fam_mixed && *fam == cur_fam;
+                                        if is_sel || resp.hovered() {
+                                            let bg = if is_sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                            ui.painter().rect_filled(r, 0.0, bg);
+                                        }
+                                        ui.painter().text(Pos2::new(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, fam, FontId::proportional(FONT), TEXT);
+                                        if is_sel && clicked_value {
+                                            resp.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if resp.clicked() {
+                                            picked = Some(fam.clone());
+                                        }
+                                    }
+                                });
+                        });
+                    if let Some(fam) = picked {
+                        let uri = format!("rbxasset://fonts/families/{fam}.json");
+                        if fam_mixed || uri != f.family {
+                            edits.push(Edit::SubProp(name.to_string(), SubEdit::FontFamily(uri)));
+                        }
+                    }
+                }
+                if open {
+                    // Weight sub-row
+                    let w_key = format!("{name}.Weight");
+                    let (wr, wv, wresp) = Self::cells(p, &w_key);
+                    Self::name_text(p, wr, 1.0, "Weight", color, None);
+                    let w_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                        Some(Variant::Font(other)) => other.weight != f.weight,
+                        _ => true,
+                    });
+                    const WEIGHTS: &[(&str, FontWeight)] = &[
+                        ("Thin", FontWeight::Thin),
+                        ("ExtraLight", FontWeight::ExtraLight),
+                        ("Light", FontWeight::Light),
+                        ("Regular", FontWeight::Regular),
+                        ("Medium", FontWeight::Medium),
+                        ("SemiBold", FontWeight::SemiBold),
+                        ("Bold", FontWeight::Bold),
+                        ("ExtraBold", FontWeight::ExtraBold),
+                        ("Heavy", FontWeight::Heavy),
+                    ];
+                    let w_label = if w_mixed { "" } else { WEIGHTS.iter().find(|(_, w)| *w == f.weight).map(|(l, _)| *l).unwrap_or("Regular") };
+                    Self::value_label(p, wv, w_label, color);
+                    let on_w_val = wresp.interact_pointer_pos().is_some_and(|q| q.x >= wv.min.x);
+                    if !ro {
+                        let wid = egui::Id::new(("font_weight_popup", name));
+                        if wresp.clicked() && on_w_val {
+                            egui::Popup::open_id(p.ui.ctx(), wid);
+                        }
+                        let mut picked_w = None;
+                        const ITEM_H: f32 = 19.0;
+                        let width = wv.width().max(110.0);
+                        egui::Popup::new(wid, p.ui.ctx().clone(), egui::PopupAnchor::Position(wv.left_bottom()), p.ui.layer_id())
+                            .kind(egui::PopupKind::Menu)
+                            .open_memory(None)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .width(width)
+                            .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                            .show(|ui| {
+                                ui.set_width(width - 4.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                for (lbl, w) in WEIGHTS {
+                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
+                                    let is_sel = !w_mixed && *w == f.weight;
+                                    if is_sel || resp.hovered() {
+                                        let bg = if is_sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        ui.painter().rect_filled(r, 0.0, bg);
+                                    }
+                                    ui.painter().text(Pos2::new(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, *lbl, FontId::proportional(FONT), TEXT);
+                                    if resp.clicked() {
+                                        picked_w = Some(*w);
+                                    }
+                                }
+                            });
+                        if let Some(w) = picked_w.filter(|w| w_mixed || *w != f.weight) {
+                            edits.push(Edit::SubProp(name.to_string(), SubEdit::FontWeight(w)));
+                        }
+                    }
+
+                    // Style sub-row
+                    let s_key = format!("{name}.Style");
+                    let (sr, sv, sresp) = Self::cells(p, &s_key);
+                    Self::name_text(p, sr, 1.0, "Style", color, None);
+                    let s_mixed = sel.len() > 1 && all_vals.iter().skip(1).any(|o| match o {
+                        Some(Variant::Font(other)) => other.style != f.style,
+                        _ => true,
+                    });
+                    const STYLES: &[(&str, FontStyle)] = &[("Normal", FontStyle::Normal), ("Italic", FontStyle::Italic)];
+                    let s_label = if s_mixed { "" } else { STYLES.iter().find(|(_, s)| *s == f.style).map(|(l, _)| *l).unwrap_or("Normal") };
+                    Self::value_label(p, sv, s_label, color);
+                    let on_s_val = sresp.interact_pointer_pos().is_some_and(|q| q.x >= sv.min.x);
+                    if !ro {
+                        let sid = egui::Id::new(("font_style_popup", name));
+                        if sresp.clicked() && on_s_val {
+                            egui::Popup::open_id(p.ui.ctx(), sid);
+                        }
+                        let mut picked_s = None;
+                        const ITEM_H: f32 = 19.0;
+                        let width = sv.width().max(100.0);
+                        egui::Popup::new(sid, p.ui.ctx().clone(), egui::PopupAnchor::Position(sv.left_bottom()), p.ui.layer_id())
+                            .kind(egui::PopupKind::Menu)
+                            .open_memory(None)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                            .width(width)
+                            .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                            .show(|ui| {
+                                ui.set_width(width - 4.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                for (lbl, st) in STYLES {
+                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ITEM_H), Sense::click());
+                                    let is_sel = !s_mixed && *st == f.style;
+                                    if is_sel || resp.hovered() {
+                                        let bg = if is_sel { Color32::from_rgb(19, 35, 93) } else { Color32::from_rgb(45, 48, 58) };
+                                        ui.painter().rect_filled(r, 0.0, bg);
+                                    }
+                                    ui.painter().text(Pos2::new(r.min.x + 6.0, r.center().y), egui::Align2::LEFT_CENTER, *lbl, FontId::proportional(FONT), TEXT);
+                                    if resp.clicked() {
+                                        picked_s = Some(*st);
+                                    }
+                                }
+                            });
+                        if let Some(st) = picked_s.filter(|st| s_mixed || *st != f.style) {
+                            edits.push(Edit::SubProp(name.to_string(), SubEdit::FontStyle(st)));
                         }
                     }
                 }
@@ -818,19 +1414,43 @@ impl Editor {
             Variant::Tags(_) | Variant::Attributes(_) => {}
             other if !ro && number_of(other).is_some() && crate::prop_slider::spec_for(class, name).is_some() => {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
-                self.slider_cell(p, name, other, spec, v, &resp, clicked_value, edits);
+                self.slider_cell(p, name, other, mixed, spec, v, &resp, clicked_value, edits);
             }
             other => {
-                let shown = value_text(&self.game.doc, other);
+                // For String properties, preserve full text (including newlines) when editing.
+                let display = if mixed { String::new() } else { value_text(&self.game.doc, other) };
+                let edit_initial = if mixed {
+                    String::new()
+                } else if let Variant::String(s) = other {
+                    s.clone()
+                } else {
+                    display.clone()
+                };
                 let editable = !ro
-                    && matches!(other, Variant::String(_) | Variant::Int32(_) | Variant::Int64(_) | Variant::Float32(_) | Variant::Float64(_) | Variant::Vector2(_) | Variant::ContentId(_) | Variant::Content(_));
-                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && editable) {
-                    if let Some(nv) = parse_like(other, &t) {
-                        if name == "Name" {
-                            edits.push(Edit::Prop("Name".into(), nv));
-                        } else {
+                    && matches!(
+                        other,
+                        Variant::String(_)
+                            | Variant::Int32(_)
+                            | Variant::Int64(_)
+                            | Variant::Float32(_)
+                            | Variant::Float64(_)
+                            | Variant::Vector2int16(_)
+                            | Variant::Vector3int16(_)
+                            | Variant::ContentId(_)
+                            | Variant::Content(_)
+                            | Variant::NumberSequence(_)
+                    );
+                let editing = self.props.editing.as_ref().is_some_and(|(k, _)| k == name);
+                if !editing && matches!(other, Variant::String(_)) {
+                    Self::value_label(p, v, &display, if ro { READ_ONLY } else { TEXT });
+                    if let Some(t) = self.text_cell(p, name, Rect::NOTHING, &edit_initial, ro, clicked_value && editable) {
+                        if let Some(nv) = parse_like(other, &t) {
                             edits.push(Edit::Prop(name.to_string(), nv));
                         }
+                    }
+                } else if let Some(t) = self.text_cell(p, name, v, &edit_initial, ro, clicked_value && editable) {
+                    if let Some(nv) = parse_like(other, &t) {
+                        edits.push(Edit::Prop(name.to_string(), nv));
                     }
                 }
             }
@@ -838,6 +1458,58 @@ impl Editor {
         if audio_content_row && !audio_folded && self.game.doc.selection.len() == 1 {
             self.audio_preview_row(p, first);
         }
+    }
+
+    /// A UDim sub-row (`X` / `Y` of a UDim2) that opens to Scale and Offset.
+    #[allow(clippy::too_many_arguments)]
+    fn udim_rows(&mut self, p: &mut Painter, key: &str, label: &str, depth: f32, u: UDim, all: &[UDim], ro: bool, color: Color32) -> Option<UDimSubEdit> {
+        let open = self.props.open_rows.contains(key);
+        let (r, vv, resp) = Self::cells(p, key);
+        Self::name_text(p, r, depth, label, color, Some(open));
+        let on_name = resp.interact_pointer_pos().is_some_and(|q| q.x < vv.min.x);
+        if resp.clicked() && on_name && !self.props.open_rows.remove(key) {
+            self.props.open_rows.insert(key.to_string());
+        }
+        let u_mixed = all.len() > 1 && all.iter().skip(1).any(|o| (o.scale - u.scale).abs() > 1e-5 || o.offset != u.offset);
+        let shown = if u_mixed { String::new() } else { value_text(&self.game.doc, &Variant::UDim(u)) };
+        let mut out = None;
+        if let Some(t) = self.text_cell(p, key, vv, &shown, ro, resp.clicked() && !on_name && !ro) {
+            if let Some(Variant::UDim(n)) = parse_like(&Variant::UDim(u), &t) {
+                out = Some(UDimSubEdit::Whole(n));
+            }
+        }
+        if open {
+            out = self.udim_parts(p, key, depth + 1.0, u, all, ro, color).or(out);
+        }
+        out
+    }
+
+    /// The `Scale` and `Offset` rows under a UDim.
+    #[allow(clippy::too_many_arguments)]
+    fn udim_parts(&mut self, p: &mut Painter, key: &str, depth: f32, u: UDim, all: &[UDim], ro: bool, color: Color32) -> Option<UDimSubEdit> {
+        let mut out = None;
+        for (i, label) in ["Scale", "Offset"].iter().enumerate() {
+            let k = format!("{key}.{label}");
+            let (r, vv, resp) = Self::cells(p, &k);
+            Self::name_text(p, r, depth, label, color, None);
+            let comp_mixed = all.len() > 1 && all.iter().skip(1).any(|o| {
+                if i == 0 { (o.scale - u.scale).abs() > 1e-5 } else { o.offset != u.offset }
+            });
+            let shown = if comp_mixed {
+                String::new()
+            } else if i == 0 {
+                fmt_num(u.scale as f64)
+            } else {
+                u.offset.to_string()
+            };
+            let on_val = resp.interact_pointer_pos().is_some_and(|q| q.x >= vv.min.x);
+            if let Some(t) = self.text_cell(p, &k, vv, &shown, ro, resp.clicked() && on_val && !ro) {
+                if let Ok(x) = t.trim().parse::<f64>() {
+                    out = Some(if i == 0 { UDimSubEdit::Scale(x as f32) } else { UDimSubEdit::Offset(x.round() as i32) });
+                }
+            }
+        }
+        out
     }
 
     /// Studio 0.748's indented `Preview` child row under `Asset -> AudioContent`
@@ -927,6 +1599,7 @@ impl Editor {
         p: &mut Painter,
         name: &str,
         value: &Variant,
+        mixed: bool,
         spec: crate::prop_slider::SliderSpec,
         v: Rect,
         resp: &egui::Response,
@@ -945,8 +1618,9 @@ impl Editor {
         let over = p.ui.ctx().pointer_latest_pos().is_some_and(|q| resp.rect.contains(q));
         let held = p.ui.ctx().is_being_dragged(p.ui.id().with(("slider", name)));
         let shown = over || held || dragging || editing || self.props.active_row.as_deref() == Some(name);
+        let text_val = if mixed { String::new() } else { fmt_num(cur) };
         if !shown {
-            Self::value_label(p, v, &fmt_num(cur), TEXT);
+            Self::value_label(p, v, &text_val, TEXT);
             return;
         }
         // Studio's editor fills the value cell from the divider.
@@ -964,7 +1638,7 @@ impl Editor {
         rustudio_engine::ti::paint(&painter, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
         let text_rect = Rect::from_min_max(spin.min + Vec2::new(4.0, 0.0), Pos2::new(arrows.min.x - 2.0, spin.max.y));
         let on_text = resp.interact_pointer_pos().is_some_and(|q| text_rect.contains(q));
-        if let Some(t) = self.text_cell(p, name, text_rect, &fmt_num(cur), false, clicked_value && on_text) {
+        if let Some(t) = self.text_cell(p, name, text_rect, &text_val, false, clicked_value && on_text) {
             if let Some(nv) = parse_like(value, &t) {
                 edits.push(Edit::Prop(name.to_string(), nv));
             }
@@ -1263,6 +1937,25 @@ impl Editor {
                     }
                     self.game.doc.set_props("Set AudioContent", changes, None);
                 }
+                // Editing Image / ImageContent on ImageLabel / ImageButton keeps the twin in sync.
+                Edit::Prop(name, v)
+                    if matches!(name.as_str(), "Image" | "ImageContent")
+                        && self.game.doc.class_of(first).is_some_and(|cl| matches!(cl.as_str(), "ImageLabel" | "ImageButton")) =>
+                {
+                    let uri = match &v {
+                        Variant::Content(c) => c.as_uri().unwrap_or("").to_string(),
+                        Variant::ContentId(c) => c.as_str().to_string(),
+                        _ => String::new(),
+                    };
+                    let mut changes = Vec::new();
+                    for &r in sel {
+                        if self.game.doc.class_of(r).is_some_and(|cl| matches!(cl.as_str(), "ImageLabel" | "ImageButton")) {
+                            changes.push((r, ustr("Image"), Variant::ContentId(uri.clone().into())));
+                            changes.push((r, ustr("ImageContent"), Variant::Content(rbx_dom_weak::types::Content::from(uri.clone()))));
+                        }
+                    }
+                    self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                }
                 Edit::Prop(name, v) => {
                     let targets: Vec<Ref> = sel
                         .iter()
@@ -1271,6 +1964,23 @@ impl Editor {
                         .collect();
                     let changes = targets.iter().map(|r| (*r, ustr(&name), v.clone())).collect();
                     self.game.doc.set_props(&format!("Set {name}"), changes, Some(format!("prop:{name}:{targets:?}")));
+                }
+                Edit::SubProp(name, sub) => {
+                    let mut changes = Vec::new();
+                    for &r in sel {
+                        let Some(c) = self.game.doc.class_of(r).map(|s| s.to_string()) else { continue };
+                        if !has_prop(&c, &name) {
+                            continue;
+                        }
+                        if let Some(old) = self.prop_value(r, &c, &name) {
+                            if let Some(nv) = sub.apply(&old) {
+                                changes.push((r, ustr(&name), nv));
+                            }
+                        }
+                    }
+                    if !changes.is_empty() {
+                        self.game.doc.set_props(&format!("Set {name}"), changes, None);
+                    }
                 }
                 Edit::Frame(f, pos, ori) => self.set_frame(first, f, pos, ori),
                 Edit::AddTag(t) => self.edit_tags(sel, |tags| {
@@ -1336,30 +2046,273 @@ impl Editor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn text_cell_on(
+    props: &mut PropertiesState,
+    frame_no: u64,
+    p: &mut Painter,
+    key: &str,
+    v: Rect,
+    shown: &str,
+    ro: bool,
+    clicked: bool,
+) -> Option<String> {
+    use egui::text::{CCursor, CCursorRange};
+    let eid = egui::Id::new(("prop_edit", key));
+    let ctx = p.ui.ctx().clone();
+    let (pressed, down, pos, now, shift) =
+        p.ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift));
+    // Count quick presses once a frame (1 = caret, 2 = word, 3 = all).
+    if pressed && props.press_frame != frame_no {
+        props.press_frame = frame_no;
+        let near = pos.zip(props.press_pos).is_some_and(|(a, b)| a.distance(b) < 6.0);
+        props.press_count = if near && now - props.press_time < 0.4 { props.press_count % 3 + 1 } else { 1 };
+        props.press_time = now;
+        props.press_pos = pos;
+    }
+    let editing = props.editing.as_ref().is_some_and(|(k, _)| k == key);
+    if !editing {
+        Editor::value_label(p, v, shown, if ro { READ_ONLY } else { TEXT });
+        if clicked && !ro {
+            props.editing = Some((key.to_string(), shown.to_string()));
+            props.select_all_pending = true;
+            let mut st = egui::text_edit::TextEditState::default();
+            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(shown.chars().count()))));
+            st.store(&ctx, eid);
+            // Request focus immediately so on the next frame `has_focus(eid)`
+            // (and `owns_ime_events(eid)`) is already true — egui 0.36
+            // collapses any non-empty cursor selection when `!owns_ime_events`.
+            ctx.memory_mut(|m| m.request_focus(eid));
+            props.drag = None;
+            props.edit_layout = None;
+            ctx.request_repaint();
+        }
+        return None;
+    }
+    let mut text = props.editing.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+    let n = text.chars().count();
+    if props.select_all_pending {
+        let mut st = egui::text_edit::TextEditState::load(&ctx, eid).unwrap_or_default();
+        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+        st.store(&ctx, eid);
+        if ctx.memory(|m| m.has_focus(eid)) {
+            props.select_all_pending = false;
+        }
+    }
+    // Selection from the pointer, worked out against last frame's layout
+    // so this frame already paints it.
+    let mut sel: Option<(usize, usize)> = None;
+    if let Some((_, galley, gpos, rect)) = props.edit_layout.clone().filter(|l| l.0 == key) {
+        let char_at = |q: Pos2| usize::from(galley.cursor_from_pos(q - gpos).index).min(n);
+        match (pos, props.drag) {
+            (Some(q), _) if pressed && rect.contains(q) => {
+                let c = char_at(q);
+                let (a, b) = match props.press_count {
+                    1 if shift => {
+                        let anchor = egui::text_edit::TextEditState::load(&ctx, eid)
+                            .and_then(|s| s.cursor.char_range())
+                            .map_or(c, |r| usize::from(r.secondary.index));
+                        (anchor, c)
+                    }
+                    1 => (c, c),
+                    2 => word_bounds(&text, c),
+                    _ => (0, n),
+                };
+                props.drag = Some((props.press_count, a, b));
+                sel = Some((a, b));
+            }
+            (Some(q), Some((mode, a, b))) if down && !pressed => {
+                let c = char_at(q);
+                sel = Some(match mode {
+                    1 => (a, c),
+                    2 => {
+                        let (wa, wb) = word_bounds(&text, c);
+                        if wa < a { (b, wa) } else { (a, wb.max(b)) }
+                    }
+                    _ => (0, n),
+                });
+            }
+            _ => {}
+        }
+    }
+    if !down {
+        props.drag = None;
+    }
+    if let Some((a, b)) = sel {
+        let mut st = egui::text_edit::TextEditState::load(&ctx, eid).unwrap_or_default();
+        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
+        st.store(&ctx, eid);
+    }
+    let out = p
+        .ui
+        .scope_builder(egui::UiBuilder::new().max_rect(v).layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)), |ui| {
+            egui::TextEdit::singleline(&mut text).id(eid).frame(egui::Frame::NONE).font(FontId::proportional(FONT)).show(ui)
+        })
+        .inner;
+    let resp = out.response.response.clone();
+    // Sits over the edit box so egui's own click handling never runs.
+    p.ui.interact(resp.rect, eid.with("mouse"), egui::Sense::CLICK | egui::Sense::DRAG).on_hover_cursor(egui::CursorIcon::Text);
+    props.edit_layout = Some((key.to_string(), out.galley.clone(), out.galley_pos, resp.rect));
+    resp.request_focus();
+    let (enter, esc) = p.ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+    if esc {
+        props.editing = None;
+        props.select_all_pending = false;
+        return None;
+    }
+    if enter || resp.lost_focus() {
+        props.editing = None;
+        props.select_all_pending = false;
+        return Some(text);
+    }
+    props.editing = Some((key.to_string(), text));
+    None
+}
+
+enum UDimSubEdit {
+    Whole(UDim),
+    Scale(f32),
+    Offset(i32),
+}
+
+fn strip_rich_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn opt_variant_eq(a: Option<&Variant>, b: Option<&Variant>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => variant_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn variant_eq(a: &Variant, b: &Variant) -> bool {
+    const EPS: f32 = 1e-5;
+    match (a, b) {
+        (Variant::Bool(x), Variant::Bool(y)) => x == y,
+        (Variant::Int32(x), Variant::Int32(y)) => x == y,
+        (Variant::Int64(x), Variant::Int64(y)) => x == y,
+        (Variant::Float32(x), Variant::Float32(y)) => (x - y).abs() < EPS,
+        (Variant::Float64(x), Variant::Float64(y)) => (x - y).abs() < 1e-5,
+        (Variant::String(x), Variant::String(y)) => x == y,
+        (Variant::Vector2(x), Variant::Vector2(y)) => (x.x - y.x).abs() < EPS && (x.y - y.y).abs() < EPS,
+        (Variant::Vector3(x), Variant::Vector3(y)) => (x.x - y.x).abs() < EPS && (x.y - y.y).abs() < EPS && (x.z - y.z).abs() < EPS,
+        (Variant::UDim(x), Variant::UDim(y)) => (x.scale - y.scale).abs() < EPS && x.offset == y.offset,
+        (Variant::UDim2(x), Variant::UDim2(y)) => {
+            (x.x.scale - y.x.scale).abs() < EPS && x.x.offset == y.x.offset && (x.y.scale - y.y.scale).abs() < EPS && x.y.offset == y.y.offset
+        }
+        (Variant::Rect(x), Variant::Rect(y)) => {
+            (x.min.x - y.min.x).abs() < EPS && (x.min.y - y.min.y).abs() < EPS && (x.max.x - y.max.x).abs() < EPS && (x.max.y - y.max.y).abs() < EPS
+        }
+        (Variant::NumberRange(x), Variant::NumberRange(y)) => (x.min - y.min).abs() < EPS && (x.max - y.max).abs() < EPS,
+        (Variant::Color3(x), Variant::Color3(y)) => (x.r - y.r).abs() < 0.002 && (x.g - y.g).abs() < 0.002 && (x.b - y.b).abs() < 0.002,
+        (Variant::Color3uint8(x), Variant::Color3uint8(y)) => x == y,
+        (Variant::Color3(x), Variant::Color3uint8(y)) | (Variant::Color3uint8(y), Variant::Color3(x)) => {
+            ((x.r * 255.0).round() as u8) == y.r && ((x.g * 255.0).round() as u8) == y.g && ((x.b * 255.0).round() as u8) == y.b
+        }
+        (Variant::BrickColor(x), Variant::BrickColor(y)) => x == y,
+        (Variant::Enum(x), Variant::Enum(y)) => x.to_u32() == y.to_u32(),
+        (Variant::Enum(x), Variant::EnumItem(y)) | (Variant::EnumItem(y), Variant::Enum(x)) => x.to_u32() == y.value,
+        (Variant::EnumItem(x), Variant::EnumItem(y)) => x.value == y.value,
+        (Variant::ContentId(x), Variant::ContentId(y)) => x.as_str() == y.as_str(),
+        (Variant::Content(x), Variant::Content(y)) => x.as_uri() == y.as_uri(),
+        (Variant::Font(x), Variant::Font(y)) => x.family == y.family && x.weight == y.weight && x.style == y.style,
+        (Variant::Ref(x), Variant::Ref(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Whether an editable property differs from its class default in the
+/// reflection database (Studio bolds modified property names).
+fn is_non_default(class: &str, name: &str, value: &Variant, ro: bool) -> bool {
+    if ro || matches!(name, "ClassName" | "Parent" | "UniqueId" | "IsInSandbox") {
+        return false;
+    }
+    if name == "Name" {
+        return matches!(value, Variant::String(s) if s != class);
+    }
+    let db = doc::db();
+    let Some(desc) = db.classes.get(class) else {
+        return false;
+    };
+    let Some(def) = db.superclasses_iter(desc).find_map(|c| c.default_properties.get(name)) else {
+        return false;
+    };
+    !variant_eq(value, def)
+}
+
 /// A property with no stored value and no default in the reflection
 /// database (IgnoreGuiInset, AbsoluteSize…): the empty value of its type.
 fn typed_empty(class: &str, prop: &str) -> Option<Variant> {
     use rbx_dom_weak::types::VariantType as T;
     let db = doc::db();
     let desc = db.classes.get(class)?;
-    let ty = db.superclasses_iter(desc).find_map(|c| match &c.properties.get(prop)?.data_type {
-        rbx_reflection::DataType::Value(t) => Some(*t),
+    let dt = db.superclasses_iter(desc).find_map(|c| Some(&c.properties.get(prop)?.data_type))?;
+    match dt {
+        rbx_reflection::DataType::Enum(_) => Some(Variant::Enum(Enum::from_u32(0))),
+        rbx_reflection::DataType::Value(ty) => Some(match ty {
+            T::Bool => Variant::Bool(false),
+            T::Float32 => Variant::Float32(0.0),
+            T::Float64 => Variant::Float64(0.0),
+            T::Int32 => Variant::Int32(0),
+            T::Int64 => Variant::Int64(0),
+            T::String => Variant::String(String::new()),
+            T::Vector2 => Variant::Vector2(Vector2::new(0.0, 0.0)),
+            T::Vector3 => Variant::Vector3(rbx_dom_weak::types::Vector3::new(0.0, 0.0, 0.0)),
+            T::UDim => Variant::UDim(UDim::new(0.0, 0)),
+            T::UDim2 => Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0))),
+            T::Rect => Variant::Rect(RbxRect::new(Vector2::new(0.0, 0.0), Vector2::new(0.0, 0.0))),
+            T::NumberRange => Variant::NumberRange(NumberRange::new(0.0, 0.0)),
+            T::NumberSequence => Variant::NumberSequence(NumberSequence {
+                keypoints: vec![NumberSequenceKeypoint::new(0.0, 0.0, 0.0), NumberSequenceKeypoint::new(1.0, 0.0, 0.0)],
+            }),
+            T::ColorSequence => Variant::ColorSequence(ColorSequence {
+                keypoints: vec![
+                    ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 1.0, 1.0)),
+                    ColorSequenceKeypoint::new(1.0, Color3::new(1.0, 1.0, 1.0)),
+                ],
+            }),
+            T::Color3 => Variant::Color3(Color3::new(1.0, 1.0, 1.0)),
+            T::Font => Variant::Font(RbxFont::regular("rbxasset://fonts/families/SourceSansPro.json")),
+            T::Ref => Variant::Ref(Ref::none()),
+            T::Content => Variant::Content(rbx_dom_weak::types::Content::from(String::new())),
+            T::ContentId => Variant::ContentId(String::new().into()),
+            _ => return None,
+        }),
         _ => None,
-    })?;
-    Some(match ty {
-        T::Bool => Variant::Bool(false),
-        T::Float32 => Variant::Float32(0.0),
-        T::Float64 => Variant::Float64(0.0),
-        T::Int32 => Variant::Int32(0),
-        T::Int64 => Variant::Int64(0),
-        T::String => Variant::String(String::new()),
-        T::Vector2 => Variant::Vector2(Vector2::new(0.0, 0.0)),
-        T::Vector3 => Variant::Vector3(rbx_dom_weak::types::Vector3::new(0.0, 0.0, 0.0)),
-        T::Ref => Variant::Ref(Ref::none()),
-        T::Content => Variant::Content(rbx_dom_weak::types::Content::from(String::new())),
-        T::ContentId => Variant::ContentId(String::new().into()),
-        _ => return None,
-    })
+    }
+}
+
+/// Studio's single-number UDim heuristic: `|v| <= 1.0` or containing `'.'` is treated as Scale;
+/// integer values with `|v| > 1.0` (e.g. `"100"`, `"-20"`) are Offset.
+fn parse_udim_single(tok: &str) -> Option<UDim> {
+    let tok = tok.trim().trim_matches(['{', '}', '[', ']']).trim();
+    let v: f32 = tok.parse().ok()?;
+    if v.abs() <= 1.0 || tok.contains('.') {
+        Some(UDim::new(v, 0))
+    } else {
+        Some(UDim::new(0.0, v.round() as i32))
+    }
+}
+
+fn normalize_asset_uri(t: &str) -> String {
+    let t = t.trim();
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        format!("rbxassetid://{t}")
+    } else {
+        t.to_string()
+    }
 }
 
 /// The enum type of `class.prop` from the reflection database.
@@ -1373,10 +2326,13 @@ fn enum_type_of(class: &str, prop: &str) -> Option<String> {
 }
 
 /// Parses typed text back into a value of the same kind.
-fn parse_like(old: &Variant, t: &str) -> Option<Variant> {
-    let t = t.trim();
+fn parse_like(old: &Variant, raw: &str) -> Option<Variant> {
+    // Preserve leading/trailing spaces and newlines for String properties.
+    if matches!(old, Variant::String(_)) {
+        return Some(Variant::String(raw.to_string()));
+    }
+    let t = raw.trim();
     Some(match old {
-        Variant::String(_) => Variant::String(t.to_string()),
         Variant::Int32(_) => Variant::Int32(t.parse::<f64>().ok()?.round() as i32),
         Variant::Int64(_) => Variant::Int64(t.parse::<f64>().ok()?.round() as i64),
         Variant::Float32(_) => Variant::Float32(t.parse().ok()?),
@@ -1385,8 +2341,127 @@ fn parse_like(old: &Variant, t: &str) -> Option<Variant> {
             let p = parse_nums(t, 2)?;
             Variant::Vector2(Vector2::new(p[0], p[1]))
         }
-        Variant::ContentId(_) => Variant::ContentId(t.to_string().into()),
-        Variant::Content(_) => Variant::Content(rbx_dom_weak::types::Content::from(t.to_string())),
+        Variant::Vector2int16(_) => {
+            let p = parse_nums(t, 2)?;
+            Variant::Vector2int16(Vector2int16::new(p[0].round() as i16, p[1].round() as i16))
+        }
+        Variant::Vector3int16(_) => {
+            let p = parse_nums(t, 3)?;
+            Variant::Vector3int16(Vector3int16::new(p[0].round() as i16, p[1].round() as i16, p[2].round() as i16))
+        }
+        // Studio UDimComponentItem::parse:
+        // 1 number -> Scale if |v| <= 1 or contains '.', else Offset;
+        // 2 numbers -> "scale, offset".
+        Variant::UDim(_) => {
+            let toks: Vec<&str> = t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+            match toks.len() {
+                1 => Variant::UDim(parse_udim_single(toks[0])?),
+                2 => {
+                    let s: f32 = toks[0].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    let o: f32 = toks[1].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    Variant::UDim(UDim::new(s, o.round() as i32))
+                }
+                _ => return None,
+            }
+        }
+        // Studio UDim2PropertyItem::parse:
+        // 1 number -> same UDim (Scale if |v|<=1 or '.', else Offset) on X and Y;
+        // 2 numbers starting with '{' -> single UDim {s, o} applied to X and Y;
+        // 2 numbers without '{' -> X and Y each parsed by the single-number rule
+        //   (so "0.5, 10" gives {0.5, 0},{0, 10}; "100, 200" gives {0, 100},{0, 200});
+        // 4 numbers -> "{xs, xo},{ys, yo}" (braces optional).
+        Variant::UDim2(_) => {
+            let toks: Vec<&str> = t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+            match toks.len() {
+                1 => {
+                    let u = parse_udim_single(toks[0])?;
+                    Variant::UDim2(UDim2::new(u, u))
+                }
+                2 if t.starts_with('{') => {
+                    let s: f32 = toks[0].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    let o: f32 = toks[1].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    let u = UDim::new(s, o.round() as i32);
+                    Variant::UDim2(UDim2::new(u, u))
+                }
+                2 => Variant::UDim2(UDim2::new(parse_udim_single(toks[0])?, parse_udim_single(toks[1])?)),
+                4 => {
+                    let p = parse_nums(t, 4)?;
+                    Variant::UDim2(UDim2::new(UDim::new(p[0], p[1].round() as i32), UDim::new(p[2], p[3].round() as i32)))
+                }
+                _ => return None,
+            }
+        }
+        // Studio RectPropertyItem::parse:
+        // 1 number v -> (0, 0, v, v); 2 numbers x, y -> (0, 0, x, y);
+        // 4 numbers -> (x0, y0, x1, y1), normalized so min <= max.
+        Variant::Rect(_) => {
+            let toks: Vec<&str> = t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect();
+            let (x0, y0, x1, y1) = match toks.len() {
+                1 => {
+                    let v: f32 = toks[0].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    (0.0, 0.0, v, v)
+                }
+                2 => {
+                    let x: f32 = toks[0].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    let y: f32 = toks[1].trim_matches(['{', '}', '[', ']']).trim().parse().ok()?;
+                    (0.0, 0.0, x, y)
+                }
+                4 => {
+                    let p = parse_nums(t, 4)?;
+                    (p[0], p[1], p[2], p[3])
+                }
+                _ => return None,
+            };
+            Variant::Rect(RbxRect::new(
+                Vector2::new(x0.min(x1), y0.min(y1)),
+                Vector2::new(x0.max(x1), y0.max(y1)),
+            ))
+        }
+        // Studio NumberRangePropertyItem:
+        // "min, max" (or "min max") or single number "v" -> (v, v).
+        Variant::NumberRange(_) => {
+            let nums: Vec<f32> = t
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.parse::<f32>().ok())
+                .collect::<Option<_>>()?;
+            match nums.len() {
+                1 => Variant::NumberRange(NumberRange::new(nums[0], nums[0])),
+                2 => Variant::NumberRange(NumberRange::new(nums[0].min(nums[1]), nums[0].max(nums[1]))),
+                _ => return None,
+            }
+        }
+        // NumberSequence: single number -> constant sequence; two numbers -> linear ramp 0..1.
+        Variant::NumberSequence(_) => {
+            let nums: Vec<f32> = t
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.parse::<f32>().ok())
+                .collect::<Option<_>>()?;
+            match nums.len() {
+                1 => Variant::NumberSequence(NumberSequence {
+                    keypoints: vec![
+                        NumberSequenceKeypoint::new(0.0, nums[0], 0.0),
+                        NumberSequenceKeypoint::new(1.0, nums[0], 0.0),
+                    ],
+                }),
+                2 => Variant::NumberSequence(NumberSequence {
+                    keypoints: vec![
+                        NumberSequenceKeypoint::new(0.0, nums[0], 0.0),
+                        NumberSequenceKeypoint::new(1.0, nums[1], 0.0),
+                    ],
+                }),
+                _ => return None,
+            }
+        }
+        // ColorSequence: "r, g, b" -> constant 2-stop color sequence.
+        Variant::ColorSequence(_) => {
+            let n = parse_nums(t, 3)?;
+            let c = [n[0].clamp(0.0, 255.0) as u8, n[1].clamp(0.0, 255.0) as u8, n[2].clamp(0.0, 255.0) as u8];
+            color_variant(old, c)
+        }
+        Variant::ContentId(_) => Variant::ContentId(normalize_asset_uri(t).into()),
+        Variant::Content(_) => Variant::Content(rbx_dom_weak::types::Content::from(normalize_asset_uri(t))),
         _ => return None,
     })
 }
@@ -1400,6 +2475,171 @@ mod tests {
         assert_eq!(super::parse_nums("1, 2, 3", 3), Some(vec![1.0, 2.0, 3.0]));
         assert_eq!(super::parse_nums("1, 2", 3), None);
         assert_eq!(super::parse_nums("1, x, 3", 3), None);
+    }
+
+    #[test]
+    fn udim2_round_trips_studio_text() {
+        use rbx_dom_weak::types::{UDim, UDim2, Variant};
+        let old = Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "{0.5, 10},{1, -20}") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.5, 10, 1.0, -20));
+        assert_eq!(super::value_text(&rustudio_core::doc::Document::new_place(), &Variant::UDim2(u)), "{0.5, 10},{1, -20}");
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "{0.5, 10}, {1, -20}") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.5, 10, 1.0, -20));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "0.25,0,0.75,4") else { panic!() };
+        assert_eq!((u.x.scale, u.y.scale, u.y.offset), (0.25, 0.75, 4));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "0.5") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.5, 0, 0.5, 0));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "1") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (1.0, 0, 1.0, 0));
+        // Studio: integer with |v| > 1 is Offset, float with '.' is Scale.
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "100") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.0, 100, 0.0, 100));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "2.5") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (2.5, 0, 2.5, 0));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "0.5, 10") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.5, 0, 0.0, 10));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "100, 200") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.0, 100, 0.0, 200));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "{0.5, 10}") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.5, 10, 0.5, 10));
+        let Some(Variant::UDim2(u)) = super::parse_like(&old, "0.25, 0.75") else { panic!() };
+        assert_eq!((u.x.scale, u.x.offset, u.y.scale, u.y.offset), (0.25, 0, 0.75, 0));
+        assert!(super::parse_like(&old, "1, 2, 3").is_none());
+        let u_old = Variant::UDim(UDim::new(0.0, 0));
+        let Some(Variant::UDim(u)) = super::parse_like(&u_old, "0.5") else { panic!() };
+        assert_eq!((u.scale, u.offset), (0.5, 0));
+        let Some(Variant::UDim(u)) = super::parse_like(&u_old, "100") else { panic!() };
+        assert_eq!((u.scale, u.offset), (0.0, 100));
+        let Some(Variant::UDim(u)) = super::parse_like(&u_old, "0, 8") else { panic!() };
+        assert_eq!(u.offset, 8);
+    }
+
+    #[test]
+    fn gui_property_parsers_and_subedits_match_studio() {
+        use rbx_dom_weak::types::{
+            Color3, ColorSequence, ColorSequenceKeypoint, Font as RbxFont, FontStyle, FontWeight, NumberRange,
+            NumberSequence, NumberSequenceKeypoint, Rect as RbxRect, UDim, UDim2, Variant, Vector2,
+        };
+        let doc = rustudio_core::doc::Document::new_place();
+
+        // Rect
+        let r_old = Variant::Rect(RbxRect::new(Vector2::new(0.0, 0.0), Vector2::new(0.0, 0.0)));
+        let Some(Variant::Rect(r)) = super::parse_like(&r_old, "10") else { panic!() };
+        assert_eq!((r.min.x, r.min.y, r.max.x, r.max.y), (0.0, 0.0, 10.0, 10.0));
+        let Some(Variant::Rect(r)) = super::parse_like(&r_old, "10, 20") else { panic!() };
+        assert_eq!((r.min.x, r.min.y, r.max.x, r.max.y), (0.0, 0.0, 10.0, 20.0));
+        let Some(Variant::Rect(r)) = super::parse_like(&r_old, "20, 10, 5, 30") else { panic!() };
+        assert_eq!((r.min.x, r.min.y, r.max.x, r.max.y), (5.0, 10.0, 20.0, 30.0));
+        assert_eq!(super::value_text(&doc, &Variant::Rect(r)), "5, 10, 20, 30");
+
+        // NumberRange
+        let nr_old = Variant::NumberRange(NumberRange::new(0.0, 0.0));
+        let Some(Variant::NumberRange(nr)) = super::parse_like(&nr_old, "5") else { panic!() };
+        assert_eq!((nr.min, nr.max), (5.0, 5.0));
+        let Some(Variant::NumberRange(nr)) = super::parse_like(&nr_old, "10, 3") else { panic!() };
+        assert_eq!((nr.min, nr.max), (3.0, 10.0));
+        assert_eq!(super::value_text(&doc, &Variant::NumberRange(nr)), "3, 10");
+
+        // NumberSequence
+        let ns_old = Variant::NumberSequence(NumberSequence { keypoints: vec![] });
+        let Some(ns) = super::parse_like(&ns_old, "0.5") else { panic!() };
+        assert_eq!(super::value_text(&doc, &ns), "0.5");
+        let ramp = Variant::NumberSequence(NumberSequence {
+            keypoints: vec![NumberSequenceKeypoint::new(0.0, 0.0, 0.0), NumberSequenceKeypoint::new(1.0, 1.0, 0.0)],
+        });
+        assert_eq!(super::value_text(&doc, &ramp), "<NumberSequence>");
+
+        // ColorSequence
+        let cs_old = Variant::ColorSequence(ColorSequence { keypoints: vec![] });
+        let Some(cs) = super::parse_like(&cs_old, "255, 0, 128") else { panic!() };
+        assert_eq!(super::value_text(&doc, &cs), "[255, 0, 128]");
+        let grad = Variant::ColorSequence(ColorSequence {
+            keypoints: vec![
+                ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 0.0, 0.0)),
+                ColorSequenceKeypoint::new(1.0, Color3::new(0.0, 0.0, 1.0)),
+            ],
+        });
+        assert_eq!(super::value_text(&doc, &grad), "<ColorSequence>");
+
+        // String preserves leading/trailing whitespace and newlines
+        let s_old = Variant::String(String::new());
+        assert_eq!(super::parse_like(&s_old, "  hello\nworld "), Some(Variant::String("  hello\nworld ".into())));
+
+        // Content / ContentId auto-prefixes bare numeric asset IDs
+        let cid_old = Variant::ContentId(String::new().into());
+        assert_eq!(super::parse_like(&cid_old, "123456"), Some(Variant::ContentId("rbxassetid://123456".into())));
+        assert_eq!(super::parse_like(&cid_old, ""), Some(Variant::ContentId("".into())));
+
+        // Multi-selection SubEdit preserves untouched components
+        let u2 = Variant::UDim2(UDim2::new(UDim::new(0.5, 10), UDim::new(1.0, -20)));
+        let Some(Variant::UDim2(u2_next)) = super::SubEdit::UDim2XOffset(42).apply(&u2) else { panic!() };
+        assert_eq!((u2_next.x.scale, u2_next.x.offset, u2_next.y.scale, u2_next.y.offset), (0.5, 42, 1.0, -20));
+
+        // Font SubEdit
+        let f = Variant::Font(RbxFont::regular("rbxasset://fonts/families/SourceSansPro.json"));
+        let Some(Variant::Font(f2)) = super::SubEdit::FontWeight(FontWeight::Bold).apply(&f) else { panic!() };
+        assert_eq!(f2.weight, FontWeight::Bold);
+        assert_eq!(f2.style, FontStyle::Normal);
+
+        // Non-default bold detection
+        assert!(!super::is_non_default("Frame", "BackgroundTransparency", &Variant::Float32(0.0), false));
+        assert!(super::is_non_default("Frame", "BackgroundTransparency", &Variant::Float32(0.5), false));
+        assert!(!super::is_non_default("Frame", "AbsoluteSize", &Variant::Vector2(Vector2::new(100.0, 100.0)), true));
+    }
+
+    /// Regression test: clicking a value cell (e.g. Position) must focus the
+    /// TextEdit with ALL text selected on the very next frame so typing
+    /// immediately replaces the entire value, matching Studio.
+    #[test]
+    fn text_cell_selects_all_on_click() {
+        let mut props = super::PropertiesState::default();
+        let ctx = egui::Context::default();
+        let key = "Position";
+        let initial = "{0, 100},{0, 200}";
+        let eid = egui::Id::new(("prop_edit", key));
+        let cell_rect = egui::Rect::from_min_size(egui::pos2(120.0, 40.0), egui::vec2(180.0, 20.0));
+
+        // Frame 1: user clicks the value cell.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
+            let out = super::text_cell_on(&mut props, 1, &mut p, key, cell_rect, initial, false, true);
+            assert!(out.is_none());
+        }).textures_delta.clear();
+
+        // Frame 2: TextEdit renders — must already have focus AND select-all range!
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
+            let out = super::text_cell_on(&mut props, 2, &mut p, key, cell_rect, initial, false, false);
+            assert!(out.is_none());
+        }).textures_delta.clear();
+        assert!(ctx.memory(|m| m.has_focus(eid)), "TextEdit must be focused after clicking cell");
+        let range = egui::text_edit::TextEditState::load(&ctx, eid)
+            .and_then(|s| s.cursor.char_range())
+            .expect("TextEdit must have a cursor range");
+        let sorted = range.as_sorted_char_range();
+        assert_eq!(
+            (usize::from(sorted.start), usize::from(sorted.end)),
+            (0, initial.chars().count()),
+            "all text must be selected on open"
+        );
+
+        // Frame 3: typing "1" + Enter replaces the entire selection instead of appending.
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Text("1".into()));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut committed = None;
+        ctx.run_ui(input, |ui| {
+            let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
+            committed = super::text_cell_on(&mut props, 3, &mut p, key, cell_rect, initial, false, false);
+        }).textures_delta.clear();
+        assert_eq!(committed.as_deref(), Some("1"));
     }
 
     #[test]

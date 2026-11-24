@@ -372,6 +372,8 @@ impl RustudioApp {
         demo: bool,
     ) -> Self {
         crate::studio_hooks::install();
+        #[cfg(target_os = "android")]
+        crate::android::keyboard::install(egui_ctx);
         rustudio_engine::ti::install(egui_ctx);
         theme::apply(egui_ctx);
         rustudio_engine::mouse_lock::note_window(wayland);
@@ -495,6 +497,13 @@ impl RustudioApp {
         if ed.harness.run.no_ui && !ed.harness.overlays {
             ed.clean_view = true;
         }
+        ed.ui.show_core_gui = ed.harness.run.show_core_gui;
+        ed.game.show_core_gui = ed.harness.run.show_core_gui;
+        if ed.harness.run.show_core_gui_explicit {
+            // A flag for this run only: the layout keeps the default (or,
+            // below, what it had saved).
+            ed.ui.show_core_gui_saved = Some(true);
+        }
         if ed.harness.selftest.is_some() {
             // Deterministic play-session timing for the scripted test.
             ed.game.fixed_dt = Some(1.0 / 60.0);
@@ -561,6 +570,10 @@ impl RustudioApp {
             let saved = crate::layout_store::load();
             if let Some(l) = &saved {
                 l.apply(&mut ed);
+                if ed.harness.run.show_core_gui_explicit {
+                    ed.ui.show_core_gui_saved = Some(ed.ui.show_core_gui);
+                    ed.ui.show_core_gui = ed.harness.run.show_core_gui;
+                }
                 if let Some(d) = l.dock() {
                     dock = d;
                 }
@@ -570,6 +583,7 @@ impl RustudioApp {
             // (plugin widgets' restore state beside layout.json)
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
+        ed.game.show_core_gui = ed.ui.show_core_gui;
         strip_disabled_native_tabs(&mut dock, &mut panels, ed.builtin_tools);
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
@@ -1100,18 +1114,26 @@ impl Editor {
     }
 
     /// Paste goes next to the selection (or into it with `into`), else Workspace.
+    /// If the selected instance is a top-level Service (parent is DataModel root,
+    /// e.g. StarterGui), paste into that service rather than directly under DataModel.
     fn paste_target(&self, into: bool) -> Ref {
-        match self.game.doc.selection.first() {
-            Some(&r) if into => r,
-            Some(&r) => self.game
-                .doc
-                .dom
-                .get_by_ref(r)
-                .map(|i| i.parent())
-                .filter(|p| p.is_some())
-                .unwrap_or(self.game.doc.default_parent()),
-            None => self.game.doc.default_parent(),
-        }
+        paste_target_for(&self.game.doc, into)
+    }
+
+    /// Whether `StarterGui.ShowDevelopmentGui` is enabled (defaults to true in Studio).
+    /// Whether the edit view shows StarterGui. `StarterGui.ShowDevelopmentGui`
+    /// decides it, as in Studio (a property of the place: saved with it and
+    /// undoable); `ui.show_gui` is only an older editor-wide switch that the
+    /// toggles below turn back on, so the two can't disagree.
+    pub fn starter_gui_shown(&self) -> bool {
+        self.ui.show_gui && starter_gui_shown_in(&self.game.doc)
+    }
+
+    /// View > UI and the Explorer eye: sets `StarterGui.ShowDevelopmentGui`
+    /// (Studio's UI visibility toggle flips that property).
+    pub fn set_starter_gui_shown(&mut self, shown: bool) {
+        self.ui.show_gui = true;
+        set_starter_gui_shown_in(&mut self.game.doc, shown);
     }
 
     pub fn paste(&mut self, into: bool) {
@@ -1264,6 +1286,7 @@ impl Editor {
                     ),
                 );
         }
+        b = apply_insert_gui_defaults(class, b);
         if matches!(class, "Script" | "LocalScript" | "ModuleScript") {
             let src = if class == "ModuleScript" {
                 "local module = {}\n\nreturn module\n"
@@ -2143,6 +2166,8 @@ impl eframe::App for RustudioApp {
         }
     }
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        #[cfg(target_os = "android")]
+        crate::android::keyboard::drain(raw);
         // A scripted run's window on Windows sits on the real desktop: the
         // person's (or an idle session's) mouse pointer over it would hover
         // and click like the script (a ribbon tooltip in a screenshot). Linux
@@ -2944,4 +2969,247 @@ pub struct SelectionInfo {
     all_true: Vec<(&'static str, bool)>,
     /// Some(shared material, if any) once asked.
     material: Option<Option<u32>>,
+}
+
+/// Studio's Insert Object / UI-tab default properties for GUI classes and UI
+/// components, over the bare class-constructor / reflection defaults.
+///
+/// Studio's Insert Object defaults for GUI objects and UI components.
+///
+/// Called by `Editor::insert_class` so the Explorer `+` popup, Insert Object
+/// window, Explorer context menu, Home > GUI, and Ribbon UI tab all apply the
+/// exact same defaults. `Position` is intentionally untouched (`{0, 0}, {0, 0}`).
+pub(crate) fn apply_insert_gui_defaults(class: &str, mut b: InstanceBuilder) -> InstanceBuilder {
+    use rbx_dom_weak::types::{Color3, Content, Enum, Font, UDim, UDim2};
+    const WHITE: Color3 = Color3::new(1.0, 1.0, 1.0);
+    const BLACK: Color3 = Color3::new(0.0, 0.0, 0.0);
+    const PLACEHOLDER_IMAGE: &str = "rbxasset://textures/ui/GuiImagePlaceholder.png";
+    const SOURCE_SANS_FAMILY: &str = "rbxasset://fonts/families/SourceSansPro.json";
+
+    if doc::is_a(class, "GuiObject") {
+        // Every GuiObject (Frame, TextLabel/Button/Box, ImageLabel/Button,
+        // ScrollingFrame, ViewportFrame, CanvasGroup, VideoFrame, …).
+        b = b
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+            .with_property("BackgroundColor3", WHITE)
+            .with_property("BorderColor3", BLACK)
+            .with_property("BorderSizePixel", 0i32);
+
+        if doc::is_a(class, "TextLabel")
+            || doc::is_a(class, "TextButton")
+            || doc::is_a(class, "TextBox")
+        {
+            // Font = Enum.Font.SourceSans (3) → FontFace SourceSansPro Regular;
+            // FontSize = Enum.FontSize.Size14 (5) → TextSize 14.0;
+            // Size = {0, 200}, {0, 50}; TextColor3 = [0, 0, 0].
+            // Text stays at its class default ("Label" / "Button" / "TextBox").
+            b = b
+                .with_property("FontFace", Font::regular(SOURCE_SANS_FAMILY))
+                .with_property("TextSize", 14.0f32)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))
+                .with_property("TextColor3", BLACK);
+        } else if doc::is_a(class, "ImageLabel") || doc::is_a(class, "ImageButton") {
+            b = b.with_property("ImageContent", Content::from(PLACEHOLDER_IMAGE));
+        } else if doc::is_a(class, "ScrollingFrame") {
+            b = b
+                .with_property("Active", true)
+                .with_property("ScrollBarImageColor3", BLACK);
+        } else if doc::is_a(class, "TextChannelWindow") {
+            b = b.with_property("Size", UDim2::new(UDim::new(0.0, 250), UDim::new(0.0, 200)));
+        }
+        if doc::is_a(class, "InputActionLabel") {
+            b = b
+                .with_property("AutomaticSize", Enum::from_u32(1)) // Enum.AutomaticSize.X
+                .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 36)));
+        }
+    } else if doc::is_a(class, "BillboardGui") {
+        b = b
+            .with_property("Size", UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))
+            .with_property("LightInfluence", 1.0f32)
+            .with_property("ClipsDescendants", true)
+            .with_property("Active", true);
+    } else if doc::is_a(class, "SurfaceGui") {
+        b = b
+            .with_property("LightInfluence", 1.0f32)
+            .with_property("ClipsDescendants", true)
+            .with_property("SizingMode", Enum::from_u32(1)) // Enum.SurfaceGuiSizingMode.PixelsPerStud
+            .with_property("MaxDistance", 1000.0f32);
+    } else if doc::is_a(class, "UIGridStyleLayout") {
+        // UIListLayout, UIGridLayout, UIPageLayout, UITableLayout.
+        b = b.with_property("SortOrder", Enum::from_u32(2)); // Enum.SortOrder.LayoutOrder
+    } else if doc::is_a(class, "UIShadow") {
+        b = b
+            .with_property("BlurRadius", UDim::new(0.0, 20))
+            .with_property("Transparency", 0.5f32);
+    }
+
+    if doc::is_a(class, "LayerCollector") {
+        // ScreenGui, SurfaceGui, BillboardGui, AdGui, …
+        b = b.with_property("ZIndexBehavior", Enum::from_u32(1)); // Enum.ZIndexBehavior.Sibling
+    }
+
+    b
+}
+
+#[cfg(test)]
+mod insert_gui_tests {
+    use super::apply_insert_gui_defaults;
+    use rbx_dom_weak::types::{Color3, ContentId, Enum, Font, UDim, UDim2, Variant};
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_core::doc::{self, Document};
+
+    fn insert(doc: &mut Document, parent: rbx_dom_weak::types::Ref, class: &str) -> rbx_dom_weak::types::Ref {
+        let b = apply_insert_gui_defaults(
+            class,
+            InstanceBuilder::new(class).with_name(doc::default_instance_name(class)),
+        );
+        doc.insert(parent, b)
+    }
+
+    #[test]
+    fn gui_insert_defaults_match_studio() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_svc = doc.find_child(root, "StarterGui").expect("StarterGui");
+
+        // ScreenGui: LayerCollector gets ZIndexBehavior = Sibling (1).
+        let sg = insert(&mut doc, sg_svc, "ScreenGui");
+        assert_eq!(doc.prop(sg, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        // Frame: 100x100 offset, white bg, black border, 0 border px, {0,0},{0,0} pos.
+        let frame = insert(&mut doc, sg, "Frame");
+        assert_eq!(doc.prop(frame, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))));
+        assert_eq!(doc.prop(frame, "Position"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)))));
+        assert_eq!(doc.prop(frame, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))));
+        assert_eq!(doc.prop(frame, "BorderColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))));
+        assert_eq!(doc.prop(frame, "BorderSizePixel"), Some(Variant::Int32(0)));
+        assert_eq!(doc.prop(frame, "BackgroundTransparency"), Some(Variant::Float32(0.0)));
+        assert_eq!(doc.prop(frame, "Active"), Some(Variant::Bool(false)));
+        assert_eq!(doc.prop(frame, "LayoutOrder"), Some(Variant::Int32(0)));
+
+        // ViewportFrame, CanvasGroup, VideoFrame inherit base GuiObject 100x100 defaults.
+        for cls in ["ViewportFrame", "CanvasGroup", "VideoFrame"] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))), "{cls}");
+            assert_eq!(doc.prop(r, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BorderSizePixel"), Some(Variant::Int32(0)), "{cls}");
+        }
+
+        // TextLabel, TextButton, TextBox: 200x50, SourceSans 14, black text, class default Text.
+        for (cls, expected_text) in [("TextLabel", "Label"), ("TextButton", "Button"), ("TextBox", "TextBox")] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))), "{cls}");
+            assert_eq!(doc.prop(r, "FontFace"), Some(Variant::Font(Font::regular("rbxasset://fonts/families/SourceSansPro.json"))), "{cls}");
+            assert_eq!(doc.prop(r, "TextSize"), Some(Variant::Float32(14.0)), "{cls}");
+            assert_eq!(doc.prop(r, "TextColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BackgroundColor3"), Some(Variant::Color3(Color3::new(1.0, 1.0, 1.0))), "{cls}");
+            assert_eq!(doc.prop(r, "BorderSizePixel"), Some(Variant::Int32(0)), "{cls}");
+            assert_eq!(doc.prop(r, "Text"), Some(Variant::String(expected_text.into())), "{cls}");
+        }
+
+        // ImageLabel, ImageButton: 100x100 + GuiImagePlaceholder.png.
+        for cls in ["ImageLabel", "ImageButton"] {
+            let r = insert(&mut doc, sg, cls);
+            assert_eq!(doc.prop(r, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))), "{cls}");
+            assert_eq!(
+                doc.prop(r, "Image"),
+                Some(Variant::ContentId(ContentId::from("rbxasset://textures/ui/GuiImagePlaceholder.png"))),
+                "{cls}"
+            );
+        }
+
+        // ScrollingFrame: 100x100 + Active true + black ScrollBarImageColor3.
+        let sf = insert(&mut doc, sg, "ScrollingFrame");
+        assert_eq!(doc.prop(sf, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))));
+        assert_eq!(doc.prop(sf, "Active"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(sf, "ScrollBarImageColor3"), Some(Variant::Color3(Color3::new(0.0, 0.0, 0.0))));
+
+        // BillboardGui & SurfaceGui.
+        let ws = doc.workspace().expect("Workspace");
+        let bb = insert(&mut doc, ws, "BillboardGui");
+        assert_eq!(doc.prop(bb, "Size"), Some(Variant::UDim2(UDim2::new(UDim::new(0.0, 200), UDim::new(0.0, 50)))));
+        assert_eq!(doc.prop(bb, "LightInfluence"), Some(Variant::Float32(1.0)));
+        assert_eq!(doc.prop(bb, "ClipsDescendants"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(bb, "Active"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(bb, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        let surf = insert(&mut doc, ws, "SurfaceGui");
+        assert_eq!(doc.prop(surf, "LightInfluence"), Some(Variant::Float32(1.0)));
+        assert_eq!(doc.prop(surf, "ClipsDescendants"), Some(Variant::Bool(true)));
+        assert_eq!(doc.prop(surf, "SizingMode"), Some(Variant::Enum(Enum::from_u32(1))));
+        assert_eq!(doc.prop(surf, "MaxDistance"), Some(Variant::Float32(1000.0)));
+        assert_eq!(doc.prop(surf, "ZIndexBehavior"), Some(Variant::Enum(Enum::from_u32(1))));
+
+        // UIGridStyleLayout subclasses: SortOrder = LayoutOrder (2).
+        for cls in ["UIListLayout", "UIGridLayout", "UIPageLayout", "UITableLayout"] {
+            let r = insert(&mut doc, frame, cls);
+            assert_eq!(doc.prop(r, "SortOrder"), Some(Variant::Enum(Enum::from_u32(2))), "{cls}");
+        }
+
+        // UICorner keeps Studio's {0, 8} default.
+        let corner = insert(&mut doc, frame, "UICorner");
+        assert_eq!(doc.prop(corner, "CornerRadius"), Some(Variant::UDim(UDim::new(0.0, 8))));
+    }
+
+    #[test]
+    fn gui_paste_target_and_show_development_gui_toggle() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_svc = doc.find_child(root, "StarterGui").expect("StarterGui");
+        let sg = doc.insert(sg_svc, InstanceBuilder::new("ScreenGui").with_name("ScreenGui"));
+        let frame = doc.insert(sg, InstanceBuilder::new("Frame").with_name("Frame"));
+
+        // ShowDevelopmentGui defaults to true and toggles cleanly with undo.
+        assert!(super::starter_gui_shown_in(&doc));
+        super::set_starter_gui_shown_in(&mut doc, false);
+        assert!(!super::starter_gui_shown_in(&doc));
+        assert_eq!(doc.prop(sg_svc, "ShowDevelopmentGui"), Some(Variant::Bool(false)));
+        assert!(doc.undo().is_some());
+        assert!(super::starter_gui_shown_in(&doc));
+
+        // Pasting with a top-level Service (StarterGui) selected pastes INTO StarterGui,
+        // never directly under DataModel root.
+        doc.selection = vec![sg_svc];
+        assert_eq!(super::paste_target_for(&doc, false), sg_svc);
+        assert_eq!(super::paste_target_for(&doc, true), sg_svc);
+
+        // Pasting with a Frame selected pastes next to it (ScreenGui); Paste Into pastes into Frame.
+        doc.selection = vec![frame];
+        assert_eq!(super::paste_target_for(&doc, false), sg);
+        assert_eq!(super::paste_target_for(&doc, true), frame);
+    }
+}
+
+fn paste_target_for(doc: &Document, into: bool) -> Ref {
+    let root = doc.dom.root_ref();
+    match doc.selection.first() {
+        Some(&r) if into => r,
+        Some(&r) => match doc.dom.get_by_ref(r).map(|i| i.parent()) {
+            Some(p) if p == root => r,
+            Some(p) if p.is_some() => p,
+            _ => doc.default_parent(),
+        },
+        None => doc.default_parent(),
+    }
+}
+
+fn starter_gui_shown_in(doc: &Document) -> bool {
+    let root = doc.dom.root_ref();
+    doc.find_child(root, "StarterGui")
+        .and_then(|sg| match doc.prop(sg, "ShowDevelopmentGui") {
+            Some(rbx_dom_weak::types::Variant::Bool(b)) => Some(b),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+fn set_starter_gui_shown_in(doc: &mut Document, shown: bool) {
+    let root = doc.dom.root_ref();
+    if let Some(sg) = doc.find_child(root, "StarterGui").filter(|_| starter_gui_shown_in(doc) != shown) {
+        doc.set_props(
+            "Toggle ShowDevelopmentGui",
+            vec![(sg, rbx_dom_weak::ustr("ShowDevelopmentGui"), rbx_dom_weak::types::Variant::Bool(shown))],
+            None,
+        );
+    }
 }

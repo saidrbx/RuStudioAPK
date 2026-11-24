@@ -4,7 +4,7 @@ use egui::scroll_area::{DragScroll, ScrollBarVisibility, ScrollSource};
 use egui::{Context, Id, RichText, Ui};
 use egui_dock::TabViewer;
 use rbx_dom_weak::types::Ref;
-use rustudio_core::mech::MOBILE_SCRIPT_SHEET_FRACTION;
+use rustudio_core::mech::{MOBILE_EXPLORER_WIDTH_FRACTION, MOBILE_SCRIPT_SHEET_FRACTION};
 use rustudio_engine::{theme, ti};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -145,6 +145,24 @@ impl Workspace {
             ui.menu_button(ti::text("menu-2", 18.0), |ui| ed.mobile_menu(ui))
                 .response
                 .on_hover_text("Menu");
+            if !playing {
+                ui.menu_button(
+                    labeled("camera", "Camera"),
+                    crate::mobile::edit_camera_controls,
+                );
+                for (action, icon, label) in [
+                    ("undo", "arrow-back-up", "Undo"),
+                    ("redo", "arrow-forward-up", "Redo"),
+                ] {
+                    let enabled = ed.action_state(action).0;
+                    let button = ui.add_enabled(enabled, egui::Button::new(ti::text(icon, 18.0)));
+                    button.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+                    if button.on_hover_text(label).clicked() {
+                        ed.ui_action(ctx, action);
+                    }
+                }
+            }
+            ed.mcp_top_button(ui);
             if ui
                 .add(egui::Button::selectable(
                     !self.visible,
@@ -190,14 +208,6 @@ impl Workspace {
             })
             .response
             .on_hover_text("Panels");
-            if !playing {
-                ui.menu_button(
-                    ti::text("camera", 18.0),
-                    crate::mobile::edit_camera_controls,
-                )
-                .response
-                .on_hover_text("Camera");
-            }
             if self.ribbon_visible(ctx) {
                 ui.separator();
                 for (tab, icon) in [
@@ -326,7 +336,7 @@ impl Workspace {
 
         let panel = match side {
             Dock::Right => {
-                let preferred = space.x * crate::panels::placement("explorer").size;
+                let preferred = space.x * MOBILE_EXPLORER_WIDTH_FRACTION;
                 let width = preferred.max(row.x * 5.0).min(space.x / 3.0);
                 egui::Panel::right("mobile_right_dock").exact_size(width)
             }

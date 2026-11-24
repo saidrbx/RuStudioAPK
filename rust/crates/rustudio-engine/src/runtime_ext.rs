@@ -3163,6 +3163,13 @@ pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value>
                         }) {
                             return Ok(Value::Buffer(lua.create_buffer(b)?));
                         }
+                        // `zbase64` is the same payload zstd-compressed first.
+                        if let Some(b) = m.get("zbase64").and_then(|b| b.as_str()).and_then(|b| {
+                            let z = crate::runtime::domains::services::encoding::base64_decode(b.as_bytes())?;
+                            zstd_unbounded_frame(&z)
+                        }) {
+                            return Ok(Value::Buffer(lua.create_buffer(b)?));
+                        }
                     }
                     _ => {}
                 }
@@ -3174,6 +3181,24 @@ pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value>
             Value::Table(t)
         }
     })
+}
+
+/// Decompresses a zstd payload for JSONDecode's `zbase64` buffers. Frames
+/// that don't record their content size (streaming compressors) are read
+/// through the stream decoder, capped at Luau's 1 GiB buffer limit.
+fn zstd_unbounded_frame(z: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 1 << 30;
+    if let Ok(b) = crate::runtime::domains::services::encoding::decompress(z) {
+        return Some(b);
+    }
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(z)
+        .ok()?
+        .take(LIMIT + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    (out.len() as u64 <= LIMIT).then_some(out)
 }
 
 fn guid() -> String {
@@ -6981,6 +7006,14 @@ mod tests {
             assert(d.a ~= d.a and d.b == -math.huge)
             local b = H:JSONDecode('{"m":null,"t":"buffer","base64":"AAA="}')
             assert(typeof(b) == "buffer" and buffer.len(b) == 2)
+            -- zbase64: zstd frame of "hello" (content size recorded)
+            local z = H:JSONDecode('{"m":null,"t":"buffer","zbase64":"KLUv/SAFKQAAaGVsbG8="}')
+            assert(typeof(z) == "buffer" and buffer.tostring(z) == "hello", typeof(z))
+            local enc = game:GetService("EncodingService")
+            local big = buffer.fromstring(string.rep("abc", 5000))
+            local zz = enc:CompressBuffer(big, Enum.CompressionAlgorithm.Zstd, 3)
+            local round = H:JSONDecode(`\{"m":null,"t":"buffer","zbase64":"{buffer.tostring(enc:Base64Encode(zz))}"}`)
+            assert(buffer.tostring(round) == string.rep("abc", 5000))
             local arr = H:JSONDecode("[1,null,3]")
             assert(arr[1] == 1 and arr[2] == nil and arr[3] == 3)
             ok, err = pcall(H.JSONDecode, H, "{a:1}")

@@ -113,6 +113,8 @@ enum Target {
 struct Root {
     /// Drawn over the world (AlwaysOnTop, ScreenGuis), not depth-tested.
     on_top: bool,
+    /// Render layer: 0 = 3D world GUIs, 1 = 3D AlwaysOnTop GUIs, 2 = ScreenGuis.
+    layer: u8,
     /// LightInfluence / Brightness: the colour factor (gamma space).
     light: f32,
     order: i64,
@@ -860,13 +862,15 @@ impl Gui {
         };
         let mut layered: Vec<Ref> = Vec::new();
         if let Some(pg) = screen_parent {
-            for g in children(d, pg) {
+            let mut stack: Vec<Ref> = children(d, pg);
+            stack.reverse();
+            while let Some(g) = stack.pop() {
                 let Some(class) = d.class_of(g) else { continue };
-                if !boolp(d, g, "Enabled", true) {
-                    continue;
-                }
                 match class.as_str() {
                     "ScreenGui" => {
+                        if !boolp(d, g, "Enabled", true) {
+                            continue;
+                        }
                         // ScreenInsets None / DeviceSafeInsets (IgnoreGuiInset, which
                         // doc.rs derives from it both ways): the whole view.
                         // TopbarSafeInsets: the top bar's free area, GuiService.TopbarInset
@@ -876,11 +880,27 @@ impl Gui {
                         let si = enum_u32(d.prop(g, "ScreenInsets"));
                         let ignore = matches!(si, Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
-                        let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
+                        // Editing (StarterGui): no top bar in the edit DataModel, so
+                        // every ScreenGui covers the whole view at AbsolutePosition
+                        // 0, 0 whatever its ScreenInsets (STUDIO-FACTS F46;
+                        // checks/gui-layout/studio captures: GetGuiInset 0, the
+                        // CoreUISafeInsets ScreenGui at 0, 0 the viewport's size).
+                        // Roblox's UIEditor draws its outline and handles at the
+                        // frame's AbsolutePosition in a default ScreenGui it makes
+                        // in CoreGui (UIEditor.rbxm CoreGuiManager.createScreenGui
+                        // sets only ClipToDeviceSafeArea / SafeAreaCompatibility),
+                        // drawn here with no inset (Roots::CoreGui): with the 58 px
+                        // inset this ScreenGui sat that far below the outline.
+                        let (target, canvas, abs_offset) = if inp.playing {
+                            self.screen_root(rect, si, inset)
+                        } else {
+                            (Target::Screen(rect.min), [rect.width(), rect.height()], [0.0, 0.0])
+                        };
                         roots.push(Root {
                             on_top: true,
+                            layer: 2,
                             light: 1.0,
-                            order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                            order: num(d, g, "DisplayOrder", 0.0) as i64,
                             dist: 0.0,
                             gui: g,
                             target,
@@ -899,7 +919,16 @@ impl Gui {
                             }
                         }
                     }
-                    "SurfaceGui" | "BillboardGui" => layered.push(g),
+                    "SurfaceGui" | "BillboardGui" => {
+                        if boolp(d, g, "Enabled", true) {
+                            layered.push(g);
+                        }
+                    }
+                    "Folder" => {
+                        let mut k = children(d, g);
+                        k.reverse();
+                        stack.extend(k);
+                    }
                     _ => {}
                 }
             }
@@ -907,7 +936,7 @@ impl Gui {
         // CoreGui during Play: Roblox's built-in in-experience UIs (ExperienceChat,
         // bubbleChat BillboardGuis, top-bar chat toggle) live in CoreGui, respecting
         // ScreenInsets / DisplayOrder just like PlayerGui.
-        if inp.playing && inp.roots == Roots::View {
+        if inp.playing && inp.roots == Roots::View && !self.hide_core_gui {
             if let Some(core) = d.find_child(root, "CoreGui") {
                 let mut stack: Vec<Ref> = children(d, core);
                 stack.reverse();
@@ -929,8 +958,9 @@ impl Gui {
                             let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
                             roots.push(Root {
                                 on_top: true,
+                                layer: 2,
                                 light: 1.0,
-                                order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                order: num(d, g, "DisplayOrder", 0.0) as i64,
                                 dist: 0.0,
                                 gui: g,
                                 target,
@@ -980,6 +1010,7 @@ impl Gui {
                 if d.exists(w) {
                     roots.push(Root {
                         on_top: true,
+                        layer: 2,
                         light: 1.0,
                         order: 0,
                         dist: 0.0,
@@ -1003,8 +1034,9 @@ impl Gui {
                             if boolp(d, g, "Enabled", true) {
                                 roots.push(Root {
                                     on_top: true,
+                                    layer: 2,
                                     light: 1.0,
-                                    order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                    order: num(d, g, "DisplayOrder", 0.0) as i64,
                                     dist: 0.0,
                                     gui: g,
                                     target: Target::Screen(rect.min),
@@ -1080,8 +1112,9 @@ impl Gui {
                 };
                 roots.push(Root {
                     on_top,
+                    layer: u8::from(on_top),
                     light,
-                    order: if on_top { 500_000 } else { 0 } + z_offset,
+                    order: z_offset,
                     dist,
                     gui: g,
                     target,
@@ -1093,13 +1126,13 @@ impl Gui {
         // Back to front: 3D GUIs (far first, AlwaysOnTop after), then ScreenGuis by DisplayOrder.
         {
             let _sort = rustudio_core::bench::scope("gui_z_sort");
-            // (stably by order, then far to near: the same order as a
+            // (stably by layer and order, then far to near: the same order as a
             // stable sort of the roots, sorting small keys instead)
-            let mut keys: Vec<(i64, f32, u32)> =
-                roots.iter().enumerate().map(|(i, r)| (r.order, r.dist, i as u32)).collect();
-            keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+            let mut keys: Vec<(u8, i64, f32, u32)> =
+                roots.iter().enumerate().map(|(i, r)| (r.layer, r.order, r.dist, i as u32)).collect();
+            keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.total_cmp(&a.2)).then(a.3.cmp(&b.3)));
             let mut slots: Vec<Option<Root>> = roots.drain(..).map(Some).collect();
-            roots.extend(keys.iter().map(|k| slots[k.2 as usize].take().expect("each root once")));
+            roots.extend(keys.iter().map(|k| slots[k.3 as usize].take().expect("each root once")));
         }
         drop(place);
 
@@ -2320,7 +2353,16 @@ impl Gui {
                 std::mem::take(&mut sh.tb_script_sel),
             )
         };
+        let in_hidden_core = |r: Ref| {
+            self.hide_core_gui
+                && doc
+                    .find_child(doc.dom.root_ref(), "CoreGui")
+                    .is_some_and(|c| doc.is_ancestor(c, r))
+        };
         for req in focus_reqs {
+            if req.is_some_and(in_hidden_core) {
+                continue;
+            }
             if req.is_some() && req != self.focus {
                 self.swallow = self.last_key_char.take().filter(|(_, at)| now - *at < WINDOW);
                 self.tb_blink = now_s;
@@ -2354,7 +2396,7 @@ impl Gui {
             self.swallow = None;
         }
         let Some(f) = self.focus else { return false };
-        if !doc.exists(f) {
+        if !doc.exists(f) || in_hidden_core(f) {
             self.focus = None;
             self.tb_cursor = -1;
             self.tb_sel = -1;
@@ -3532,5 +3574,81 @@ mod billboard_canvas_tests {
         assert_eq!(gui.cache[&root].key, small_key);
         assert_eq!(gui.layout[&child], small);
         assert_eq!(gui.cache_owner[&child].0, root);
+    }
+}
+
+#[cfg(test)]
+mod edit_screen_gui_tests {
+    use super::*;
+    use rbx_dom_weak::types::{UDim, UDim2};
+    use rbx_dom_weak::InstanceBuilder;
+
+    /// Editing, a StarterGui ScreenGui (IgnoreGuiInset false, ScreenInsets
+    /// CoreUISafeInsets) covers the whole view: no 58 px top bar in the edit
+    /// DataModel (checks/gui-layout/studio captures: GetGuiInset 0, the
+    /// ScreenGui at 0, 0 the viewport's size). It must be drawn where its
+    /// AbsolutePosition says, as the CoreGui overlay Roblox's UIEditor draws
+    /// its outline in (Roots::CoreGui, no inset), or the outline sits 58 px
+    /// above the frame.
+    #[test]
+    fn edit_screen_gui_draws_at_its_absolute_position() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let sg = d.find_child(root, "StarterGui").expect("StarterGui");
+        let screen = d.insert(sg, InstanceBuilder::new("ScreenGui"));
+        let at = |x: i32, y: i32| UDim2::new(UDim::new(0.0, x), UDim::new(0.0, y));
+        let b = d.insert(
+            screen,
+            InstanceBuilder::new("TextButton").with_property("Position", at(10, 20)).with_property("Size", at(100, 40)),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::new(300.0, 100.0), egui::vec2(800.0, 600.0));
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            gui.draw(
+                ui.ctx(),
+                &painter,
+                DrawIn { render_state: None, doc: &d, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Roots::View },
+            );
+        });
+        out.textures_delta.clear();
+        let laid = gui.layout.get(&b).copied().expect("laid out");
+        assert_eq!(laid.pos, [10.0, 20.0]);
+        let c = gui.screen_center(b).expect("drawn");
+        assert!((c.x - (300.0 + 10.0 + 50.0)).abs() < 0.5 && (c.y - (100.0 + 20.0 + 20.0)).abs() < 0.5, "drawn at {c:?}");
+    }
+
+    #[test]
+    fn edit_starter_gui_renders_screen_gui_inside_folder() {
+        let mut d = Document::new_place();
+        let root = d.dom.root_ref();
+        let sg = d.find_child(root, "StarterGui").expect("StarterGui");
+        let folder = d.insert(sg, InstanceBuilder::new("Folder").with_name("Menus"));
+        let screen = d.insert(folder, InstanceBuilder::new("ScreenGui").with_name("Hud"));
+        let at = |x: i32, y: i32| UDim2::new(UDim::new(0.0, x), UDim::new(0.0, y));
+        let frame = d.insert(
+            screen,
+            InstanceBuilder::new("Frame").with_property("Position", at(20, 30)).with_property("Size", at(100, 50)),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.painter().clone();
+            gui.draw(
+                ui.ctx(),
+                &painter,
+                DrawIn { render_state: None, doc: &d, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Roots::View },
+            );
+        });
+        out.textures_delta.clear();
+        let laid = gui.layout.get(&frame).copied().expect("ScreenGui inside Folder in StarterGui should lay out");
+        assert_eq!(laid.pos, [20.0, 30.0]);
+        assert_eq!(laid.size, [100.0, 50.0]);
     }
 }
